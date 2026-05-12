@@ -107,7 +107,7 @@ impl SpanEncoderSelector {
                     let bpe_vocab = Arc::new(BpeVocab::from_vocab(vocab));
                     Arc::new(move || Box::new(BpeBacktrackSpanEncoder::new(bpe_vocab.clone())))
                 } else {
-                    Arc::new(|| Box::new(BufferSweepSpanEncoder::<T>::default()))
+                    Arc::new(|| Box::new(PriorityMergeSpanEncoder::<T>::default()))
                 }
             }
         }
