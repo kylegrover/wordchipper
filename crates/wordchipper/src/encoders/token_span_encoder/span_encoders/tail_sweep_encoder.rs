@@ -27,9 +27,9 @@ impl<T: TokenType> SpanEncoder<T> for TailSweepSpanEncoder<T> {
         tokens: &mut Vec<T>,
     ) {
         // Reuse the output buffer as our working memory.
-        // Append the byte-tokens to the buffer.
+        // Append the initial primitive tokens to the buffer.
         let start = tokens.len();
-        vocab.byte_vocab().append_tokens(span, tokens);
+        vocab.append_seed_tokens(span, tokens);
 
         // Incrementally shrink the working memory (the new buffer end)
         // Until we can no longer find pairs to merge.
@@ -39,8 +39,13 @@ impl<T: TokenType> SpanEncoder<T> for TailSweepSpanEncoder<T> {
             if let Some((token, idx)) = tokens[start..]
                 .windows(2)
                 .enumerate()
-                .filter_map(|(idx, w)| vocab.lookup_pair(&(w[0], w[1])).map(|token| (token, idx)))
-                .min()
+                .filter_map(|(idx, w)| {
+                    vocab
+                        .lookup_pair_merge(&(w[0], w[1]))
+                        .map(|(rank, token)| (rank, idx, token))
+                })
+                .min_by_key(|&(rank, idx, _)| (rank, idx))
+                .map(|(_, idx, token)| (token, idx))
             {
                 // Adjust the window index.
                 let idx = start + idx;

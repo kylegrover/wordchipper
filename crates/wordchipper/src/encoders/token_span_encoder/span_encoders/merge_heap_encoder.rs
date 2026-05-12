@@ -16,7 +16,8 @@ use crate::{
 /// to avoid secondary lookups in the pair vocab.
 #[derive(Default, Debug, Clone)]
 pub struct MergeHeapSpanEncoder<T: TokenType> {
-    pair_ranks: Vec<T>,
+    pair_ranks: Vec<u32>,
+    marker: core::marker::PhantomData<T>,
 }
 
 impl<T: TokenType> SpanEncoder<T> for MergeHeapSpanEncoder<T> {
@@ -32,13 +33,14 @@ impl<T: TokenType> SpanEncoder<T> for MergeHeapSpanEncoder<T> {
 
         // Define CURRENT as `tokens[start..]`.
         // - CURRENT[i] := tokens[start + i]
-        vocab.byte_vocab().append_tokens(span, tokens);
+        vocab.append_seed_tokens(span, tokens);
 
         let pr_for_tokens = {
             |tok: &[T], a: usize, b: usize| {
                 vocab
-                    .lookup_pair(&(tok[start + a], tok[start + b]))
-                    .unwrap_or(T::max_value())
+                    .lookup_pair_merge(&(tok[start + a], tok[start + b]))
+                    .map(|(rank, _)| rank)
+                    .unwrap_or(u32::MAX)
             }
         };
 
@@ -53,14 +55,22 @@ impl<T: TokenType> SpanEncoder<T> for MergeHeapSpanEncoder<T> {
             .pair_ranks
             .iter()
             .enumerate()
-            .filter_map(|(i, &new_token)| {
-                if new_token != T::max_value() {
-                    Some((new_token, i))
+            .filter_map(|(i, &rank)| {
+                if rank != u32::MAX {
+                    Some((rank, i))
                 } else {
                     None
                 }
             })
-            .min()
+            .min_by_key(|&(rank, i)| (rank, i))
+            .map(|(_, i)| {
+                (
+                    vocab
+                        .lookup_pair(&(tokens[start + i], tokens[start + i + 1]))
+                        .unwrap(),
+                    i,
+                )
+            })
         {
             // At this point, i selects CURRENT[i], PAIR_RANKS[i] such that:
             // - PAIR_RANKS[i] != max_value

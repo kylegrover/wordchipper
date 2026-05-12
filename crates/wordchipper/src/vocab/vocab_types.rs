@@ -14,6 +14,12 @@ use crate::{
 /// Instance names should prefer `pair_map`, or `pair_token_map`.
 pub type PairTokenMap<T> = WCHashMap<Pair<T>, T>;
 
+/// `{ Pair<T> -> u32 }` merge-rank map.
+///
+/// ## Style Hints
+/// Instance names should prefer `pair_ranks`, or `merge_ranks`.
+pub type PairRankMap<T> = WCHashMap<Pair<T>, u32>;
+
 /// `{ T -> Pair<T> }` map.
 ///
 /// ## Style Hints

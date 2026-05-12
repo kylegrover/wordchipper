@@ -103,8 +103,12 @@ impl SpanEncoderSelector {
             MergeHeap => Arc::new(|| Box::new(MergeHeapSpanEncoder::<T>::default())),
             PriorityMerge => Arc::new(|| Box::new(PriorityMergeSpanEncoder::<T>::default())),
             ConcurrentDefault | SingleThreadDefault | BpeBacktrack => {
-                let bpe_vocab = Arc::new(BpeVocab::from_vocab(vocab));
-                Arc::new(move || Box::new(BpeBacktrackSpanEncoder::new(bpe_vocab.clone())))
+                if vocab.supports_backtrack_encoder() {
+                    let bpe_vocab = Arc::new(BpeVocab::from_vocab(vocab));
+                    Arc::new(move || Box::new(BpeBacktrackSpanEncoder::new(bpe_vocab.clone())))
+                } else {
+                    Arc::new(|| Box::new(BufferSweepSpanEncoder::<T>::default()))
+                }
             }
         }
     }

@@ -37,7 +37,7 @@ pub trait SpanEncoder<T: TokenType>: Send {
         match span_ref {
             SpanRef::Word(range) => {
                 let span = &text[range].as_bytes();
-                if let Some(token) = vocab.lookup_token(span) {
+                if vocab.direct_word_lookup() && let Some(token) = vocab.lookup_token(span) {
                     // 1. Faster;
                     // 2. Correct-or: Some words may not exist in the pair mappings.
                     tokens.push(token);

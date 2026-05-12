@@ -16,6 +16,7 @@ use crate::{
         DEFAULT_BYTE_PER_TOKEN_RATIO,
         PairMapVocab,
         TokenPairMap,
+        TokenSpanMap,
     },
 };
 
@@ -29,6 +30,9 @@ use crate::{
 pub struct PairExpansionDecoder<T: TokenType> {
     /// Byte/token mapping table.
     byte_vocab: ByteMapVocab<T>,
+
+    /// Primitive token expansions.
+    primitive_spans: TokenSpanMap<T>,
 
     /// Token to pair mapping.
     token_pairs: TokenPairMap<T>,
@@ -48,7 +52,11 @@ impl<T: TokenType> PairExpansionDecoder<T> {
             .iter()
             .map(|(&pair, &token)| (token, pair))
             .collect();
-        Self::new(pair_vocab.byte_vocab().clone(), token_pairs)
+        Self::new(
+            pair_vocab.byte_vocab().clone(),
+            pair_vocab.primitive_spans().clone(),
+            token_pairs,
+        )
     }
 
     /// Creates a new Decoder.
@@ -61,10 +69,12 @@ impl<T: TokenType> PairExpansionDecoder<T> {
     /// A new `PairExpansionDecoder` instance.
     pub fn new(
         byte_vocab: ByteMapVocab<T>,
+        primitive_spans: TokenSpanMap<T>,
         token_pairs: TokenPairMap<T>,
     ) -> Self {
         Self {
             byte_vocab,
+            primitive_spans,
             token_pairs,
         }
     }
@@ -97,6 +107,8 @@ impl<T: TokenType> TokenDecoder<T> for PairExpansionDecoder<T> {
             while let Some(t) = stack.pop() {
                 if let Some(b) = self.byte_vocab.get_byte(t) {
                     value.push(b);
+                } else if let Some(span) = self.primitive_spans.get(&t) {
+                    value.extend_from_slice(span);
                 } else if let Some((a, b)) = self.token_pairs.get(&t) {
                     stack.push(*b);
                     stack.push(*a);

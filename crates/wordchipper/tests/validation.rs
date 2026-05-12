@@ -13,6 +13,7 @@ use wordchipper::{
     UnifiedTokenVocab,
     disk_cache::WordchipperDiskCache,
     encoders::token_span_encoder::SpanEncoderSelector,
+    load_vocab,
     pretrained::openai::OATokenizer,
 };
 
@@ -37,6 +38,15 @@ const SAMPLES: &[&str] = &[
 fn load_model(model: OATokenizer) -> Arc<wordchipper::Tokenizer<u32>> {
     let mut disk_cache = WordchipperDiskCache::default();
     let vocab: Arc<UnifiedTokenVocab<u32>> = model.load_vocab(&mut disk_cache).unwrap().into();
+    TokenizerOptions::default().build(vocab)
+}
+
+fn load_model_by_name(model: &str) -> Arc<wordchipper::Tokenizer<u32>> {
+    let mut disk_cache = WordchipperDiskCache::default();
+    let vocab: Arc<UnifiedTokenVocab<u32>> = load_vocab(model, &mut disk_cache)
+        .unwrap()
+        .vocab()
+        .clone();
     TokenizerOptions::default().build(vocab)
 }
 
@@ -92,6 +102,24 @@ fn tokenizers_validation(
     }
 }
 
+fn tokenizers_validation_by_name(
+    model: &str,
+    hf_tok: &Tokenizer,
+) {
+    let tokenizer = load_model_by_name(model);
+
+    for text in SAMPLES.iter().chain(["とめちゃう", "めab", "日本語 mixed with ASCII abc"].iter()) {
+        let wc_tokens = tokenizer.try_encode(text, None).unwrap();
+        let hf_encoding = hf_tok.encode(*text, true).unwrap();
+        let hf_tokens: Vec<u32> = hf_encoding.get_ids().to_vec();
+
+        assert_eq!(
+            wc_tokens, hf_tokens,
+            "Encode mismatch (wordchipper vs tokenizers) for {model:?}: {text:?}"
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn cl100k_roundtrip() {
@@ -130,6 +158,14 @@ fn cl100k_vs_tokenizers() {
 fn o200k_vs_tokenizers() {
     let tok = Tokenizer::from_pretrained("Xenova/gpt-4o", None).unwrap();
     tokenizers_validation(OATokenizer::O200kBase, &tok);
+}
+
+#[test]
+#[ignore]
+fn gemma4_26b_a4b_it_vs_tokenizers() {
+    let model = "hf:google/gemma-4-26B-A4B-it";
+    let tok = Tokenizer::from_pretrained("google/gemma-4-26B-A4B-it", None).unwrap();
+    tokenizers_validation_by_name(model, &tok);
 }
 
 fn load_oa_vocab(model: OATokenizer) -> Arc<UnifiedTokenVocab<u32>> {
