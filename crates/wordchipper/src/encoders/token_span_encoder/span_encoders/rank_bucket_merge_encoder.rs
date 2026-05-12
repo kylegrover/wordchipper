@@ -27,6 +27,152 @@ struct PairNode {
     next_occurrence_idx: Option<usize>,
 }
 
+struct HierarchicalBitSet {
+    levels: Vec<Vec<u64>>,
+    touched_words: Vec<Vec<usize>>,
+    max_bit: usize,
+}
+
+impl HierarchicalBitSet {
+    fn new(bit_len: usize) -> Self {
+        let bit_len = bit_len.max(1);
+        let mut word_len = bit_len.div_ceil(64);
+        let mut levels = vec![vec![0; word_len]];
+        let mut touched_words = vec![Vec::new()];
+
+        while word_len > 1 {
+            word_len = word_len.div_ceil(64);
+            levels.push(vec![0; word_len]);
+            touched_words.push(Vec::new());
+        }
+
+        Self {
+            levels,
+            touched_words,
+            max_bit: bit_len - 1,
+        }
+    }
+
+    fn clear(&mut self) {
+        for (level, touched) in self.touched_words.iter_mut().enumerate() {
+            for &word_idx in touched.iter() {
+                self.levels[level][word_idx] = 0;
+            }
+            touched.clear();
+        }
+    }
+
+    fn set(&mut self, bit_idx: usize) {
+        let mut idx = bit_idx;
+        for level in 0..self.levels.len() {
+            let word_idx = idx / 64;
+            let mask = 1u64 << (idx % 64);
+            let word = &mut self.levels[level][word_idx];
+            let prev = *word;
+
+            if prev & mask != 0 {
+                break;
+            }
+            if prev == 0 {
+                self.touched_words[level].push(word_idx);
+            }
+
+            *word |= mask;
+            if prev != 0 {
+                break;
+            }
+
+            idx = word_idx;
+        }
+    }
+
+    fn clear_bit(&mut self, bit_idx: usize) {
+        let mut idx = bit_idx;
+        for level in 0..self.levels.len() {
+            let word_idx = idx / 64;
+            let mask = 1u64 << (idx % 64);
+            let word = &mut self.levels[level][word_idx];
+
+            if *word & mask == 0 {
+                break;
+            }
+
+            *word &= !mask;
+            if *word != 0 {
+                break;
+            }
+
+            idx = word_idx;
+        }
+    }
+
+    fn next_set_bit_from(
+        &self,
+        start_bit: usize,
+    ) -> Option<usize> {
+        if start_bit > self.max_bit {
+            return None;
+        }
+
+        self.next_in_level(0, start_bit)
+            .filter(|&bit_idx| bit_idx <= self.max_bit)
+    }
+
+    fn next_in_level(
+        &self,
+        level: usize,
+        start_idx: usize,
+    ) -> Option<usize> {
+        if level + 1 == self.levels.len() {
+            return self.scan_level_words(level, start_idx);
+        }
+
+        let start_word = start_idx / 64;
+        let start_bit = start_idx % 64;
+        let mut word_idx = self.next_in_level(level + 1, start_word)?;
+
+        loop {
+            if word_idx >= self.levels[level].len() {
+                return None;
+            }
+
+            let word = self.levels[level][word_idx];
+            let bit_start = if word_idx == start_word { start_bit } else { 0 };
+            let masked = word & (u64::MAX << bit_start);
+            if masked != 0 {
+                return Some(word_idx * 64 + masked.trailing_zeros() as usize);
+            }
+
+            word_idx = self.next_in_level(level + 1, word_idx + 1)?;
+        }
+    }
+
+    fn scan_level_words(
+        &self,
+        level: usize,
+        start_idx: usize,
+    ) -> Option<usize> {
+        let words = &self.levels[level];
+        let mut word_idx = start_idx / 64;
+        if word_idx >= words.len() {
+            return None;
+        }
+
+        let mut bits = words[word_idx] & (u64::MAX << (start_idx % 64));
+        loop {
+            if bits != 0 {
+                return Some(word_idx * 64 + bits.trailing_zeros() as usize);
+            }
+
+            word_idx += 1;
+            if word_idx >= words.len() {
+                return None;
+            }
+            bits = words[word_idx];
+        }
+    }
+}
+
 /// A [`SpanEncoder`] using flat vectors and rank-indexed occurrence lists.
 pub struct RankBucketMergeSpanEncoder<T: TokenType> {
     max_rank: usize,
@@ -34,9 +180,8 @@ pub struct RankBucketMergeSpanEncoder<T: TokenType> {
     tokens: Vec<TokenNode<T>>,
     pairs: Vec<PairNode>,
     rank_heads: Vec<Option<usize>>,
-    active_words: Vec<u64>,
+    active_ranks: HierarchicalBitSet,
     touched_ranks: Vec<usize>,
-    touched_words: Vec<usize>,
     token_to_pair: Vec<Option<usize>>,
     current_min_rank: usize,
 }
@@ -51,9 +196,8 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             tokens: Vec::new(),
             pairs: Vec::new(),
             rank_heads: vec![None; rank_len],
-            active_words: vec![0; rank_len.div_ceil(64)],
+            active_ranks: HierarchicalBitSet::new(rank_len),
             touched_ranks: Vec::new(),
-            touched_words: Vec::new(),
             token_to_pair: Vec::new(),
             current_min_rank: rank_len,
         }
@@ -63,11 +207,8 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
         for &rank in &self.touched_ranks {
             self.rank_heads[rank] = None;
         }
-        for &word_idx in &self.touched_words {
-            self.active_words[word_idx] = 0;
-        }
         self.touched_ranks.clear();
-        self.touched_words.clear();
+        self.active_ranks.clear();
         self.current_min_rank = self.rank_heads.len();
     }
 
@@ -75,46 +216,21 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
         &mut self,
         rank: usize,
     ) {
-        let word_idx = rank / 64;
-        let mask = 1u64 << (rank % 64);
-        if self.active_words[word_idx] == 0 {
-            self.touched_words.push(word_idx);
-        }
-        self.active_words[word_idx] |= mask;
+        self.active_ranks.set(rank);
     }
 
     fn clear_active_rank(
         &mut self,
         rank: usize,
     ) {
-        let word_idx = rank / 64;
-        let mask = 1u64 << (rank % 64);
-        self.active_words[word_idx] &= !mask;
+        self.active_ranks.clear_bit(rank);
     }
 
     fn next_active_rank(
         &self,
         start_rank: usize,
     ) -> Option<usize> {
-        if start_rank > self.max_rank {
-            return None;
-        }
-
-        let mut word_idx = start_rank / 64;
-        let bit_offset = start_rank % 64;
-        let mut bits = self.active_words[word_idx] & (u64::MAX << bit_offset);
-
-        loop {
-            if bits != 0 {
-                return Some(word_idx * 64 + bits.trailing_zeros() as usize);
-            }
-
-            word_idx += 1;
-            if word_idx >= self.active_words.len() {
-                return None;
-            }
-            bits = self.active_words[word_idx];
-        }
+        self.active_ranks.next_set_bit_from(start_rank)
     }
 
     fn insert_pair(
