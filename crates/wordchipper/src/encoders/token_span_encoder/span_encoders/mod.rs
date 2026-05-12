@@ -4,6 +4,7 @@ mod bpe_backtrack_encoder;
 mod buffer_sweep_encoder;
 mod merge_heap_encoder;
 mod priority_merge_encoder;
+mod rank_bucket_merge_encoder;
 mod span_encoder;
 mod span_encoder_selector;
 mod tail_sweep_encoder;
@@ -16,6 +17,8 @@ pub use buffer_sweep_encoder::*;
 pub use merge_heap_encoder::*;
 #[doc(inline)]
 pub use priority_merge_encoder::*;
+#[doc(inline)]
+pub use rank_bucket_merge_encoder::*;
 #[doc(inline)]
 pub use span_encoder::*;
 #[doc(inline)]

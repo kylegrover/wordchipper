@@ -7,6 +7,7 @@ use divan::{
 };
 use wordchipper::{
     TokenEncoderOptions,
+    encoders::token_span_encoder::SpanEncoderSelector,
 };
 use wordchipper_bench::{
     HF_QWEN35,
@@ -43,6 +44,20 @@ fn bench_wc(
         .bench(|| encoder.try_encode(black_box(text), None).unwrap());
 }
 
+fn bench_rank_bucket(
+    bencher: Bencher,
+    text: &str,
+) {
+    let encoder = load_cached_encoder::<u32>(
+        WC_QWEN35,
+        TokenEncoderOptions::default().with_span_encoder(SpanEncoderSelector::RankBucketMerge),
+    );
+
+    bencher
+        .counter(BytesCount::new(text.len()))
+        .bench(|| encoder.try_encode(black_box(text), None).unwrap());
+}
+
 fn bench_hf(
     bencher: Bencher,
     text: &str,
@@ -58,6 +73,11 @@ mod english {
     use super::*;
 
     #[divan::bench]
+    fn rank_bucket_merge(bencher: Bencher) {
+        bench_rank_bucket(bencher, &english_text());
+    }
+
+    #[divan::bench]
     fn wordchipper(bencher: Bencher) {
         bench_wc(bencher, &english_text());
     }
@@ -70,6 +90,11 @@ mod english {
 
 mod diverse {
     use super::*;
+
+    #[divan::bench]
+    fn rank_bucket_merge(bencher: Bencher) {
+        bench_rank_bucket(bencher, &diverse_text());
+    }
 
     #[divan::bench]
     fn wordchipper(bencher: Bencher) {

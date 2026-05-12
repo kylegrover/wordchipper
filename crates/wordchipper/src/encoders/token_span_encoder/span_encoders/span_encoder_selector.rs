@@ -12,6 +12,7 @@ use crate::{
             BufferSweepSpanEncoder,
             MergeHeapSpanEncoder,
             PriorityMergeSpanEncoder,
+            RankBucketMergeSpanEncoder,
             TailSweepSpanEncoder,
             bpe_backtrack_encoder::{
                 BpeBacktrackSpanEncoder,
@@ -58,6 +59,9 @@ pub enum SpanEncoderSelector {
     /// Use the [`PriorityMergeSpanEncoder`] encoder.
     PriorityMerge,
 
+    /// Use the experimental flat-vector rank-bucket merge encoder.
+    RankBucketMerge,
+
     /// Use the [`BufferSweepSpanEncoder`] encoder.
     BufferSweep,
 
@@ -102,6 +106,16 @@ impl SpanEncoderSelector {
             TailSweep => Arc::new(|| Box::new(TailSweepSpanEncoder::<T>::default())),
             MergeHeap => Arc::new(|| Box::new(MergeHeapSpanEncoder::<T>::default())),
             PriorityMerge => Arc::new(|| Box::new(PriorityMergeSpanEncoder::<T>::default())),
+            RankBucketMerge => {
+                let max_rank = vocab
+                    .pair_vocab()
+                    .pair_map()
+                    .keys()
+                    .filter_map(|pair| vocab.lookup_pair_merge(pair).map(|(rank, _)| rank as usize))
+                    .max()
+                    .unwrap_or(0);
+                Arc::new(move || Box::new(RankBucketMergeSpanEncoder::<T>::new(max_rank)))
+            }
             ConcurrentDefault | SingleThreadDefault | BpeBacktrack => {
                 if vocab.supports_backtrack_encoder() {
                     let bpe_vocab = Arc::new(BpeVocab::from_vocab(vocab));

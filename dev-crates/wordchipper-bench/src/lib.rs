@@ -4,6 +4,8 @@ use std::sync::{
     OnceLock,
 };
 
+mod gemma_prefix_lattice;
+
 use wordchipper::{
     TokenEncoder,
     TokenEncoderOptions,
@@ -12,6 +14,8 @@ use wordchipper::{
     disk_cache::WordchipperDiskCache,
     load_vocab,
 };
+
+pub use gemma_prefix_lattice::GemmaPrefixLatticeScanner;
 
 /// `OpenAI` "`r50k_base`" vocab.
 pub const OA_R50K_BASE: &str = "openai:r50k_base";
