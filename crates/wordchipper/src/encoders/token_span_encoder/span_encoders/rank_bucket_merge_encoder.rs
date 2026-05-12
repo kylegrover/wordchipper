@@ -3,6 +3,11 @@
 //! Uses flat token and pair vectors with intrusive occurrence lists keyed by
 //! merge rank to avoid heap traffic during exact-HF BPE merging.
 
+use core::time::Duration;
+
+#[cfg(feature = "std")]
+use std::time::Instant;
+
 use crate::{
     TokenType,
     alloc::vec::Vec,
@@ -25,6 +30,74 @@ struct PairNode {
     rank: usize,
     prev_occurrence_idx: Option<usize>,
     next_occurrence_idx: Option<usize>,
+}
+
+/// Internal profiling counters for the flat-vector rank-bucket encoder.
+#[derive(Debug, Default, Clone)]
+pub struct RankBucketMergeProfile {
+    /// Time spent finding the next active rank.
+    pub next_active_rank_time: Duration,
+
+    /// Time spent unlinking pair nodes from occurrence lists.
+    pub unlink_pair_time: Duration,
+
+    /// Time spent activating new pair nodes.
+    pub activate_pair_time: Duration,
+
+    /// Total pair nodes popped from the rank heads.
+    pub pairs_popped: u64,
+
+    /// Pair nodes rejected by the active-adjacency guard.
+    pub pairs_rejected_inactive: u64,
+
+    /// Pair nodes rejected because the current tokens no longer map to a merge.
+    pub pairs_rejected_missing_lookup: u64,
+
+    /// Pair nodes rejected because the pair rank changed before pop.
+    pub pairs_rejected_rank_mismatch: u64,
+
+    /// Successful merges executed.
+    pub pairs_merged: u64,
+
+    /// Pair unlink operations executed.
+    pub pairs_unlinked: u64,
+
+    /// Pair activation operations executed.
+    pub pairs_activated: u64,
+}
+
+impl RankBucketMergeProfile {
+    /// The total number of popped pairs rejected before merge.
+    pub fn total_rejected(&self) -> u64 {
+        self.pairs_rejected_inactive
+            + self.pairs_rejected_missing_lookup
+            + self.pairs_rejected_rank_mismatch
+    }
+
+    /// Rejected pops divided by total pops.
+    pub fn pop_reject_ratio(&self) -> f64 {
+        if self.pairs_popped == 0 {
+            return 0.0;
+        }
+        self.total_rejected() as f64 / self.pairs_popped as f64
+    }
+
+    /// Merge counters and timers from another profile.
+    pub fn accumulate(
+        &mut self,
+        other: &Self,
+    ) {
+        self.next_active_rank_time += other.next_active_rank_time;
+        self.unlink_pair_time += other.unlink_pair_time;
+        self.activate_pair_time += other.activate_pair_time;
+        self.pairs_popped += other.pairs_popped;
+        self.pairs_rejected_inactive += other.pairs_rejected_inactive;
+        self.pairs_rejected_missing_lookup += other.pairs_rejected_missing_lookup;
+        self.pairs_rejected_rank_mismatch += other.pairs_rejected_rank_mismatch;
+        self.pairs_merged += other.pairs_merged;
+        self.pairs_unlinked += other.pairs_unlinked;
+        self.pairs_activated += other.pairs_activated;
+    }
 }
 
 struct HierarchicalBitSet {
@@ -258,7 +331,11 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
     fn unlink_pair(
         &mut self,
         pair_idx: usize,
+        mut profile: Option<&mut RankBucketMergeProfile>,
     ) {
+        #[cfg(feature = "std")]
+        let start = profile.as_ref().map(|_| Instant::now());
+
         let pair = self.pairs[pair_idx];
         if let Some(prev_idx) = pair.prev_occurrence_idx {
             self.pairs[prev_idx].next_occurrence_idx = pair.next_occurrence_idx;
@@ -275,11 +352,30 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
 
         self.pairs[pair_idx].prev_occurrence_idx = None;
         self.pairs[pair_idx].next_occurrence_idx = None;
+
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.pairs_unlinked += 1;
+            #[cfg(feature = "std")]
+            if let Some(start) = start {
+                profile.unlink_pair_time += start.elapsed();
+            }
+        }
     }
 
-    fn pop_min_pair(&mut self) -> Option<usize> {
+    fn pop_min_pair_profiled(
+        &mut self,
+        mut profile: Option<&mut RankBucketMergeProfile>,
+    ) -> Option<usize> {
         loop {
+            #[cfg(feature = "std")]
+            let start = profile.as_ref().map(|_| Instant::now());
             let rank = self.next_active_rank(self.current_min_rank)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                #[cfg(feature = "std")]
+                if let Some(start) = start {
+                    profile.next_active_rank_time += start.elapsed();
+                }
+            }
             self.current_min_rank = rank;
 
             let Some(pair_idx) = self.rank_heads[rank] else {
@@ -287,7 +383,10 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
                 continue;
             };
 
-            self.unlink_pair(pair_idx);
+            self.unlink_pair(pair_idx, profile.as_deref_mut());
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.pairs_popped += 1;
+            }
             return Some(pair_idx);
         }
     }
@@ -295,6 +394,7 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
     fn deactivate_pair_starting_at(
         &mut self,
         left_idx: Option<usize>,
+        mut profile: Option<&mut RankBucketMergeProfile>,
     ) {
         let Some(left_idx) = left_idx else {
             return;
@@ -304,13 +404,14 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             return;
         };
 
-        self.unlink_pair(pair_idx);
+        self.unlink_pair(pair_idx, profile.as_deref_mut());
     }
 
     fn activate_pair_starting_at(
         &mut self,
         vocab: &UnifiedTokenVocab<T>,
         left_idx: usize,
+        mut profile: Option<&mut RankBucketMergeProfile>,
     ) {
         if left_idx >= self.pairs.len() || !self.tokens[left_idx].is_active {
             if left_idx < self.token_to_pair.len() {
@@ -323,6 +424,9 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             self.token_to_pair[left_idx] = None;
             return;
         };
+
+        #[cfg(feature = "std")]
+        let start = profile.as_ref().map(|_| Instant::now());
 
         let left_tok = self.tokens[left_idx].token_id;
         let right_tok = self.tokens[right_idx].token_id;
@@ -341,30 +445,22 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
         };
         self.token_to_pair[left_idx] = Some(pair_idx);
         self.insert_pair(pair_idx);
-    }
-}
 
-impl<T: TokenType> core::fmt::Debug for RankBucketMergeSpanEncoder<T> {
-    fn fmt(
-        &self,
-        f: &mut core::fmt::Formatter<'_>,
-    ) -> core::fmt::Result {
-        f.debug_struct("RankBucketMergeSpanEncoder").finish()
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.pairs_activated += 1;
+            #[cfg(feature = "std")]
+            if let Some(start) = start {
+                profile.activate_pair_time += start.elapsed();
+            }
+        }
     }
-}
 
-impl<T: TokenType> Clone for RankBucketMergeSpanEncoder<T> {
-    fn clone(&self) -> Self {
-        Self::new(self.max_rank)
-    }
-}
-
-impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
-    fn encode_append_compound_span(
+    fn encode_append_compound_span_impl(
         &mut self,
         vocab: &UnifiedTokenVocab<T>,
         span: &[u8],
         tokens: &mut Vec<T>,
+        mut profile: Option<&mut RankBucketMergeProfile>,
     ) {
         self.seed_tokens.clear();
         vocab.append_seed_tokens(span, &mut self.seed_tokens);
@@ -393,10 +489,10 @@ impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
         }
 
         for left_idx in (0..(n - 1)).rev() {
-            self.activate_pair_starting_at(vocab, left_idx);
+            self.activate_pair_starting_at(vocab, left_idx, profile.as_deref_mut());
         }
 
-        while let Some(pair_idx) = self.pop_min_pair() {
+        while let Some(pair_idx) = self.pop_min_pair_profiled(profile.as_deref_mut()) {
             let pair = self.pairs[pair_idx];
             let left_idx = pair.left_text_idx;
             let right_idx = pair.right_text_idx;
@@ -405,6 +501,9 @@ impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
                 || self.token_to_pair[left_idx] != Some(pair_idx)
                 || self.tokens[left_idx].next_text_idx != Some(right_idx)
             {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.pairs_rejected_inactive += 1;
+                }
                 continue;
             }
 
@@ -412,20 +511,30 @@ impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
             let right_tok = self.tokens[right_idx].token_id;
             let Some((rank, merge_token)) = vocab.lookup_pair_merge(&(left_tok, right_tok)) else {
                 self.token_to_pair[left_idx] = None;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.pairs_rejected_missing_lookup += 1;
+                }
                 continue;
             };
 
             if rank as usize != pair.rank {
                 self.token_to_pair[left_idx] = None;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.pairs_rejected_rank_mismatch += 1;
+                }
                 continue;
+            }
+
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.pairs_merged += 1;
             }
 
             self.token_to_pair[left_idx] = None;
             let left_prev = self.tokens[left_idx].prev_text_idx;
             let right_next = self.tokens[right_idx].next_text_idx;
 
-            self.deactivate_pair_starting_at(left_prev);
-            self.deactivate_pair_starting_at(Some(right_idx));
+            self.deactivate_pair_starting_at(left_prev, profile.as_deref_mut());
+            self.deactivate_pair_starting_at(Some(right_idx), profile.as_deref_mut());
 
             self.tokens[left_idx].token_id = merge_token;
             self.tokens[left_idx].next_text_idx = right_next;
@@ -438,10 +547,10 @@ impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
             }
 
             if let Some(prev_idx) = left_prev {
-                self.activate_pair_starting_at(vocab, prev_idx);
+                self.activate_pair_starting_at(vocab, prev_idx, profile.as_deref_mut());
             }
             if right_next.is_some() {
-                self.activate_pair_starting_at(vocab, left_idx);
+                self.activate_pair_starting_at(vocab, left_idx, profile.as_deref_mut());
             }
         }
 
@@ -450,6 +559,45 @@ impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
             tokens.push(self.tokens[token_idx].token_id);
             idx = self.tokens[token_idx].next_text_idx;
         }
+    }
+
+    /// Profile a single compound span with the real merge loop.
+    #[cfg(feature = "std")]
+    pub fn profile_compound_span(
+        &mut self,
+        vocab: &UnifiedTokenVocab<T>,
+        span: &[u8],
+        tokens: &mut Vec<T>,
+    ) -> RankBucketMergeProfile {
+        let mut profile = RankBucketMergeProfile::default();
+        self.encode_append_compound_span_impl(vocab, span, tokens, Some(&mut profile));
+        profile
+    }
+}
+
+impl<T: TokenType> core::fmt::Debug for RankBucketMergeSpanEncoder<T> {
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        f.debug_struct("RankBucketMergeSpanEncoder").finish()
+    }
+}
+
+impl<T: TokenType> Clone for RankBucketMergeSpanEncoder<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.max_rank)
+    }
+}
+
+impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
+    fn encode_append_compound_span(
+        &mut self,
+        vocab: &UnifiedTokenVocab<T>,
+        span: &[u8],
+        tokens: &mut Vec<T>,
+    ) {
+        self.encode_append_compound_span_impl(vocab, span, tokens, None);
     }
 }
 
