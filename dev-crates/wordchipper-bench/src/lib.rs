@@ -34,6 +34,12 @@ pub const WC_QWEN35: &str = "hf:Qwen/Qwen3.5-0.8B";
 /// The huggingface/tokenizers model to use for Qwen 3.5 0.8B.
 pub const HF_QWEN35: &str = "Qwen/Qwen3.5-0.8B";
 
+/// The wordchipper model identifier for Gemma 4 26B A4B it via the HF loader.
+pub const WC_GEMMA4_26B_A4B_IT: &str = "hf:google/gemma-4-26B-A4B-it";
+
+/// The huggingface/tokenizers model to use for Gemma 4 26B A4B it.
+pub const HF_GEMMA4_26B_A4B_IT: &str = "google/gemma-4-26B-A4B-it";
+
 /// The shared disk cache for benchmarks.
 static DISK_CACHE: OnceLock<Mutex<WordchipperDiskCache>> = OnceLock::new();
 

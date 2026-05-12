@@ -12,6 +12,7 @@ and HuggingFace tokenizers.
 | `decoding_single`   | Single-string decoding                        |
 | `spanning`          | Text spanning (regex vs logos DFA)            |
 | `qwen_encoding_single` | Single-string Qwen encode vs HF tokenizers |
+| `gemma_encoding_single` | Single-string Gemma encode vs HF tokenizers |
 
 ### Encoder Variants
 
@@ -34,6 +35,7 @@ cargo bench -p wordchipper-bench --bench encoding_parallel
 cargo bench -p wordchipper-bench --bench decoding_single
 cargo bench -p wordchipper-bench --bench spanning
 cargo bench -p wordchipper-bench --bench qwen_encoding_single
+cargo bench -p wordchipper-bench --bench gemma_encoding_single
 
 # Filter by name
 cargo bench -p wordchipper-bench --bench encoding_single -- diverse

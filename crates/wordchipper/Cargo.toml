@@ -106,6 +106,7 @@ testing = []
 ## Enable loading pretrained huggingface modules.
 huggingface = [
     "std",
+    "dep:serde_json",
     "dep:tokenizers",
 ]
 

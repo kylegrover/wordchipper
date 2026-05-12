@@ -6,10 +6,13 @@ use tokenizers::{
         Sequence,
         Split,
     },
+    tokenizer::SplitDelimiterBehavior,
     tokenizer::NormalizerWrapper,
     pre_tokenizers::split::SplitPattern,
     tokenizer::Tokenizer,
 };
+
+use serde_json::Value;
 
 use crate::{
     LabeledVocab,
@@ -43,15 +46,42 @@ use crate::{
     },
 };
 
-fn extract_pattern(pt: Option<&PreTokenizerWrapper>) -> Result<RegexPattern, WCError> {
-    fn split_regex(s: &tokenizers::pre_tokenizers::split::Split) -> Result<RegexPattern, WCError> {
+const HF_WHOLE_SEGMENT_PATTERN: &str = r"[\s\S]+";
+
+enum HFBpeEncoding {
+    ByteLevel(WCHashMap<char, u8>),
+    ByteFallback,
+}
+
+fn extract_pattern(
+    pt: Option<&PreTokenizerWrapper>,
+    normalizer: Option<&TextNormalizer>,
+) -> Result<RegexPattern, WCError> {
+    fn split_pattern(
+        s: &tokenizers::pre_tokenizers::split::Split,
+        normalizer: Option<&TextNormalizer>,
+    ) -> Result<RegexPattern, WCError> {
         match &s.pattern {
             SplitPattern::Regex(r) => Ok(r.clone().into()),
-            _ => Err(WCError::External("Split without Regex pattern".into())),
+            SplitPattern::String(pattern)
+                if !s.invert
+                    && s.behavior == SplitDelimiterBehavior::MergedWithPrevious
+                    && matches!(
+                        normalizer,
+                        Some(TextNormalizer::Replace {
+                            pattern: replace_pattern,
+                            ..
+                        }) if replace_pattern == pattern
+                    ) => Ok(HF_WHOLE_SEGMENT_PATTERN.into()),
+            SplitPattern::String(pattern) => Err(WCError::External(crate::alloc::format!(
+                "unsupported string Split pre-tokenizer: pattern={pattern:?}, behavior={:?}, invert={}",
+                s.behavior,
+                s.invert
+            ))),
         }
     }
     match pt {
-        Some(Split(s)) => split_regex(s),
+        Some(Split(s)) => split_pattern(s, normalizer),
         Some(ByteLevel(bl)) if bl.use_regex => Ok(OA_GPT2_PATTERN.into()),
         Some(ByteLevel(_)) => Err(WCError::External(
             "ByteLevel with use_regex=false has no splitting regex".into(),
@@ -64,7 +94,7 @@ fn extract_pattern(pt: Option<&PreTokenizerWrapper>) -> Result<RegexPattern, WCE
                         if found.is_some() {
                             return Err(WCError::External("Sequence has multiple Splits".into()));
                         }
-                        found = Some(split_regex(s)?);
+                        found = Some(split_pattern(s, normalizer)?);
                     }
                     ByteLevel(_) => {} // sibling byte-encoder, fine
                     _ => return Err(WCError::External("unsupported member in Sequence".into())),
@@ -77,12 +107,53 @@ fn extract_pattern(pt: Option<&PreTokenizerWrapper>) -> Result<RegexPattern, WCE
     }
 }
 
+fn extract_replace_normalizer(
+    replace: &tokenizers::normalizers::Replace,
+) -> WCResult<TextNormalizer> {
+    let value = serde_json::to_value(replace).map_err(|error| {
+        WCError::External(crate::alloc::format!(
+            "failed to serialize huggingface Replace normalizer: {error}"
+        ))
+    })?;
+
+    let pattern = value
+        .get("pattern")
+        .and_then(|pattern| pattern.get("String"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WCError::External(crate::alloc::format!(
+                "unsupported huggingface Replace normalizer pattern: {value:?}"
+            ))
+        })?;
+
+    if pattern.is_empty() {
+        return Err(WCError::External(
+            "unsupported huggingface Replace normalizer with empty pattern".into(),
+        ));
+    }
+
+    let replacement = value
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WCError::External(crate::alloc::format!(
+                "unsupported huggingface Replace normalizer content: {value:?}"
+            ))
+        })?;
+
+    Ok(TextNormalizer::Replace {
+        pattern: pattern.into(),
+        replacement: replacement.into(),
+    })
+}
+
 fn extract_text_normalizer(normalizer: &NormalizerWrapper) -> WCResult<TextNormalizer> {
     match normalizer {
         NormalizerWrapper::NFC(_) => Ok(TextNormalizer::NFC),
         NormalizerWrapper::NFD(_) => Ok(TextNormalizer::NFD),
         NormalizerWrapper::NFKC(_) => Ok(TextNormalizer::NFKC),
         NormalizerWrapper::NFKD(_) => Ok(TextNormalizer::NFKD),
+        NormalizerWrapper::Replace(replace) => extract_replace_normalizer(replace),
         NormalizerWrapper::Sequence(sequence) => sequence
             .as_ref()
             .iter()
@@ -143,12 +214,128 @@ fn bytes_char() -> WCHashMap<u8, char> {
         .collect()
 }
 
+fn byte_fallback_token(byte: u8) -> String {
+    crate::alloc::format!("<0x{byte:02X}>")
+}
+
+fn byte_fallback_value(token: &str) -> Option<u8> {
+    if token.len() != 6 || !token.starts_with("<0x") || !token.ends_with('>') {
+        return None;
+    }
+
+    u8::from_str_radix(&token[3..5], 16).ok()
+}
+
+fn extract_bpe_encoding(
+    hf_vocab: &std::collections::HashMap<String, u32>,
+    byte_fallback: bool,
+) -> WCResult<HFBpeEncoding> {
+    let byte_chars = bytes_char();
+    let byte_level = (0u8..=255).all(|byte| {
+        let key: String = std::iter::once(byte_chars[&byte]).collect();
+        hf_vocab.contains_key(&key)
+    });
+    if byte_level {
+        return Ok(HFBpeEncoding::ByteLevel(
+            byte_chars.iter().map(|(&byte, &ch)| (ch, byte)).collect(),
+        ));
+    }
+
+    let fallback = (0u8..=255).all(|byte| hf_vocab.contains_key(&byte_fallback_token(byte)));
+    if fallback {
+        return Ok(HFBpeEncoding::ByteFallback);
+    }
+
+    if byte_fallback {
+        return Err(WCError::External(
+            "BPE enables byte_fallback but vocab is missing one or more <0xXX> byte tokens"
+                .into(),
+        ));
+    }
+
+    Err(WCError::External(
+        "unsupported huggingface BPE byte encoding".into(),
+    ))
+}
+
+fn token_to_bytes(
+    token: &str,
+    encoding: &HFBpeEncoding,
+) -> WCResult<Option<Vec<u8>>> {
+    match encoding {
+        HFBpeEncoding::ByteLevel(char_to_byte) => {
+            let mut bytes = Vec::with_capacity(token.len());
+
+            for ch in token.chars() {
+                match char_to_byte.get(&ch) {
+                    Some(&byte) => bytes.push(byte),
+                    None => {
+                        return Err(WCError::External(crate::alloc::format!(
+                            "token {token:?} has non-byte-level codepoint {ch:?}"
+                        )));
+                    }
+                }
+            }
+
+            Ok(Some(bytes))
+        }
+        HFBpeEncoding::ByteFallback => {
+            if byte_fallback_value(token).is_some() {
+                Ok(None)
+            } else {
+                let bytes = token.as_bytes().to_vec();
+                if bytes.len() == 1 {
+                    Ok(None)
+                } else {
+                    Ok(Some(bytes))
+                }
+            }
+        }
+    }
+}
+
+fn extract_byte_tokens(
+    hf_vocab: &std::collections::HashMap<String, u32>,
+    encoding: &HFBpeEncoding,
+) -> WCResult<Vec<u32>> {
+    (0u8..=255)
+        .map(|byte| {
+            let key = match encoding {
+                HFBpeEncoding::ByteLevel(_) => {
+                    let byte_chars = bytes_char();
+                    std::iter::once(byte_chars[&byte]).collect::<String>()
+                }
+                HFBpeEncoding::ByteFallback => {
+                    if byte.is_ascii() {
+                        let ch = char::from(byte);
+                        let single = std::iter::once(ch).collect::<String>();
+                        if hf_vocab.contains_key(&single) {
+                            single
+                        } else {
+                            byte_fallback_token(byte)
+                        }
+                    } else {
+                        byte_fallback_token(byte)
+                    }
+                }
+            };
+
+            hf_vocab.get(&key).copied().ok_or(byte)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|byte| {
+            WCError::External(crate::alloc::format!(
+                "missing byte token for 0x{byte:02x}"
+            ))
+        })
+}
+
 /// Attempt to convert a `HuggingFace` tokenizer to a `WordChipper` vocabulary.
 pub fn vocab_from_hf_tokenizer(tok: &Tokenizer) -> WCResult<Arc<UnifiedTokenVocab<u32>>> {
     type T = u32;
 
-    let pattern = extract_pattern(tok.get_pre_tokenizer())?;
     let input_normalizer = extract_normalizer(tok.get_normalizer())?;
+    let pattern = extract_pattern(tok.get_pre_tokenizer(), input_normalizer.as_ref())?;
     let mut span_config: TextSpanningConfig<T> = TextSpanningConfig::from_pattern(pattern);
 
     let BPE(bpe) = tok.get_model() else {
@@ -157,12 +344,8 @@ pub fn vocab_from_hf_tokenizer(tok: &Tokenizer) -> WCResult<Arc<UnifiedTokenVoca
         ));
     };
 
-    // TODO: Add support for unknown token.
-    if let Some(unk) = bpe.get_unk_token() {
-        return Err(WCError::External(format!("BPE has unk_token {unk:?}")));
-    }
-
     let hf_vocab = bpe.get_vocab();
+    let encoding = extract_bpe_encoding(&hf_vocab, bpe.byte_fallback)?;
 
     /*
     println!(
@@ -198,27 +381,14 @@ pub fn vocab_from_hf_tokenizer(tok: &Tokenizer) -> WCResult<Arc<UnifiedTokenVoca
         special_tokens.insert(*t);
     }
 
-    // Forward and inverse bytes_to_unicode maps.
-    let b2c = bytes_char();
-    let c2b: WCHashMap<char, u8> = b2c.iter().map(|(&b, &c)| (c, b)).collect();
-
     // Span map: decode every non-special vocab string back to bytes.
     let mut span_map: SpanTokenMap<T> = SpanTokenMap::default();
     for (s, id) in &hf_vocab {
         if special_tokens.contains(id) {
             continue;
-        } else {
-            let mut bytes = Vec::with_capacity(s.len());
-            for ch in s.chars() {
-                match c2b.get(&ch) {
-                    Some(&b) => bytes.push(b),
-                    None => {
-                        return Err(WCError::External(format!(
-                            "token {s:?} (id {id}) has non-byte-level codepoint {ch:?}"
-                        )));
-                    }
-                }
-            }
+        }
+
+        if let Some(bytes) = token_to_bytes(s, &encoding)? {
             span_map.insert(bytes, *id);
         }
     }
@@ -231,14 +401,7 @@ pub fn vocab_from_hf_tokenizer(tok: &Tokenizer) -> WCResult<Arc<UnifiedTokenVoca
         )));
     }
 
-    // Byte map: the single-char string for each byte must resolve in the vocab.
-    let byte_tokens: Vec<T> = (0u8..=255)
-        .map(|b| {
-            let key: String = std::iter::once(b2c[&b]).collect();
-            hf_vocab.get(&key).copied().ok_or(b)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|b| WCError::External(format!("missing byte token for 0x{b:02x}")))?;
+    let byte_tokens: Vec<T> = extract_byte_tokens(&hf_vocab, &encoding)?;
 
     let byte_map = ByteMapVocab::<T>::from_byte_to_token(&byte_tokens);
     let span_vocab = SpanMapVocab::<T>::new(byte_map, span_map)?;
@@ -321,12 +484,14 @@ impl VocabProvider for HFVocabProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokenizers::normalizers::Replace;
     use tokenizers::normalizers::{
         Lowercase,
         NFC,
         NormalizerWrapper,
         Sequence,
     };
+    use tokenizers::tokenizer::SplitDelimiterBehavior;
 
     #[test]
     fn test_extract_normalizer_maps_nfc() {
@@ -351,5 +516,78 @@ mod tests {
         let error = extract_normalizer(Some(&NormalizerWrapper::Lowercase(Lowercase))).unwrap_err();
 
         assert!(matches!(error, WCError::External(_)));
+    }
+
+    #[test]
+    fn test_extract_normalizer_maps_replace_string() {
+        let replace = Replace::new(" ", "▁").unwrap();
+
+        assert_eq!(
+            extract_normalizer(Some(&NormalizerWrapper::Replace(replace))).unwrap(),
+            Some(TextNormalizer::Replace {
+                pattern: " ".into(),
+                replacement: "▁".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_pattern_maps_metaspace_split() {
+        let split = tokenizers::pre_tokenizers::split::Split::new(
+            " ",
+            SplitDelimiterBehavior::MergedWithPrevious,
+            false,
+        )
+        .unwrap();
+
+        let pattern = extract_pattern(
+            Some(&PreTokenizerWrapper::Split(split)),
+            Some(&TextNormalizer::Replace {
+                pattern: " ".into(),
+                replacement: "▁".into(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(pattern.as_str(), HF_WHOLE_SEGMENT_PATTERN);
+    }
+
+    #[test]
+    fn test_extract_pattern_rejects_unpaired_string_split() {
+        let split = tokenizers::pre_tokenizers::split::Split::new(
+            " ",
+            SplitDelimiterBehavior::MergedWithPrevious,
+            false,
+        )
+        .unwrap();
+
+        let error = extract_pattern(Some(&PreTokenizerWrapper::Split(split)), None).unwrap_err();
+
+        assert!(matches!(error, WCError::External(_)));
+    }
+
+    #[test]
+    fn test_extract_byte_tokens_maps_byte_fallback_vocab() {
+        let hf_vocab = (0u8..=255)
+            .map(|byte| (byte_fallback_token(byte), byte as u32))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let tokens = extract_byte_tokens(&hf_vocab, &HFBpeEncoding::ByteFallback).unwrap();
+
+        assert_eq!(tokens.len(), 256);
+        assert_eq!(tokens[0], 0);
+        assert_eq!(tokens[255], 255);
+    }
+
+    #[test]
+    fn test_extract_byte_tokens_prefers_single_byte_chars_when_available() {
+        let mut hf_vocab = (0u8..=255)
+            .map(|byte| (byte_fallback_token(byte), byte as u32))
+            .collect::<std::collections::HashMap<_, _>>();
+        hf_vocab.insert("a".into(), 9999);
+
+        let tokens = extract_byte_tokens(&hf_vocab, &HFBpeEncoding::ByteFallback).unwrap();
+
+        assert_eq!(tokens[b'a' as usize], 9999);
     }
 }

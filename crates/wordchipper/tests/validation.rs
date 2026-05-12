@@ -132,7 +132,7 @@ fn o200k_vs_tokenizers() {
     tokenizers_validation(OATokenizer::O200kBase, &tok);
 }
 
-fn load_vocab(model: OATokenizer) -> Arc<UnifiedTokenVocab<u32>> {
+fn load_oa_vocab(model: OATokenizer) -> Arc<UnifiedTokenVocab<u32>> {
     let mut disk_cache = WordchipperDiskCache::default();
     model.load_vocab(&mut disk_cache).unwrap().into()
 }
@@ -141,7 +141,7 @@ fn span_encoder_vs_bpe(
     model: OATokenizer,
     selector: SpanEncoderSelector,
 ) {
-    let vocab = load_vocab(model);
+    let vocab = load_oa_vocab(model);
 
     let bpe_encoder = TokenEncoderOptions::default().build(vocab.clone());
     let alt_encoder = TokenEncoderOptions::default()
