@@ -81,9 +81,7 @@ mod tests {
             string::ToString,
             sync::Arc,
         },
-        disk_cache::WordchipperDiskCache,
         encoders::token_span_encoder::TokenSpanEncoder,
-        load_vocab,
         spanners::{
             TextSpannerBuilder,
             TextSpanningConfig,
@@ -141,10 +139,15 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(all(feature = "client", feature = "download"))]
     #[test]
     #[ignore]
     fn test_hf_exact_models_do_not_support_backtrack_encoder() {
+        use crate::{
+            disk_cache::WordchipperDiskCache,
+            load_vocab,
+        };
+
         let mut disk_cache = WordchipperDiskCache::default();
 
         for model in ["hf:google/gemma-4-26B-A4B-it", "hf:Qwen/Qwen3.5-0.8B"] {

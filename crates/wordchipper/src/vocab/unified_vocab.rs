@@ -28,7 +28,8 @@ use crate::{
 
 #[derive(Clone, PartialEq)]
 enum SeedStrategy<T: TokenType> {
-    Bytes,
+    Bytes(core::marker::PhantomData<T>),
+    #[cfg(any(feature = "download", test))]
     UnicodeScalars {
         scalar_tokens: SpanTokenMap<T>,
         byte_fallback_tokens: Vec<T>,
@@ -182,7 +183,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
             input_normalizer: None,
             span_vocab,
             pair_vocab,
-            seed_strategy: SeedStrategy::Bytes,
+            seed_strategy: SeedStrategy::Bytes(core::marker::PhantomData),
             direct_word_lookup: true,
         })
     }
@@ -199,7 +200,8 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
             span_vocab: self.span_vocab.to_token_type::<G>()?,
             pair_vocab: self.pair_vocab.to_token_type::<G>()?,
             seed_strategy: match &self.seed_strategy {
-                SeedStrategy::Bytes => SeedStrategy::Bytes,
+                SeedStrategy::Bytes(_) => SeedStrategy::Bytes(core::marker::PhantomData),
+                #[cfg(any(feature = "download", test))]
                 SeedStrategy::UnicodeScalars {
                     scalar_tokens,
                     byte_fallback_tokens,
@@ -229,6 +231,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         self
     }
 
+    #[cfg(any(feature = "download", test))]
     /// Configure Unicode-scalar seeding before BPE merges.
     pub(crate) fn with_unicode_scalar_seeding(
         mut self,
@@ -244,6 +247,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         self
     }
 
+    #[cfg(any(feature = "download", test))]
     /// Enable or disable direct whole-span lookup before merge encoding.
     pub(crate) fn with_direct_word_lookup(
         mut self,
@@ -295,7 +299,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
 
     /// Return whether this vocab is compatible with the current backtrack encoder.
     pub(crate) fn supports_backtrack_encoder(&self) -> bool {
-        matches!(self.seed_strategy, SeedStrategy::Bytes)
+        matches!(self.seed_strategy, SeedStrategy::Bytes(_))
             && self.pair_vocab.pair_map().iter().all(|(pair, &token)| {
                 self.lookup_pair_merge(pair)
                     .is_some_and(|(rank, merge_token)| {
@@ -311,7 +315,8 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         tokens: &mut Vec<T>,
     ) {
         match &self.seed_strategy {
-            SeedStrategy::Bytes => self.byte_vocab().append_tokens(span, tokens),
+            SeedStrategy::Bytes(_) => self.byte_vocab().append_tokens(span, tokens),
+            #[cfg(any(feature = "download", test))]
             SeedStrategy::UnicodeScalars {
                 scalar_tokens,
                 byte_fallback_tokens,
@@ -437,6 +442,8 @@ impl<T: TokenType> VocabIndex<T> for UnifiedTokenVocab<T> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use num_traits::FromPrimitive;
 
     use super::*;
@@ -489,13 +496,16 @@ mod tests {
             assert_eq!(vocab.span_vocab(), &expected);
         }
 
-        assert_eq!(
-            vocab.span_pairs().collect::<Vec<_>>(),
-            vocab.unified_dictionary()
-                .into_iter()
-                .map(|(token, span)| (span, token))
-                .collect::<Vec<_>>()
-        );
+        let mut actual = vocab.span_pairs().collect::<Vec<_>>();
+        let mut expected = vocab
+            .unified_dictionary()
+            .into_iter()
+            .map(|(token, span)| (span, token))
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+
+        assert_eq!(actual, expected);
 
         assert_eq!(vocab.lookup_token("at".as_bytes()), Some(300));
         assert_eq!(vocab.lookup_token("ate".as_bytes()), Some(301));
