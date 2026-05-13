@@ -22,6 +22,8 @@ use crate::{
 
 type PairLookupMap<T> = crate::types::WCHashMap<Pair<T>, (u32, T)>;
 
+const NO_OCCURRENCE: usize = usize::MAX;
+
 #[derive(Clone, Copy, Default)]
 struct TokenNode<T> {
     token_id: T,
@@ -30,13 +32,25 @@ struct TokenNode<T> {
     next_text_idx: Option<usize>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct PairNode {
     left_text_idx: usize,
     right_text_idx: usize,
     rank: usize,
-    prev_occurrence_idx: Option<usize>,
-    next_occurrence_idx: Option<usize>,
+    prev_occurrence_idx: usize,
+    next_occurrence_idx: usize,
+}
+
+impl Default for PairNode {
+    fn default() -> Self {
+        Self {
+            left_text_idx: 0,
+            right_text_idx: 0,
+            rank: 0,
+            prev_occurrence_idx: NO_OCCURRENCE,
+            next_occurrence_idx: NO_OCCURRENCE,
+        }
+    }
 }
 
 /// Internal profiling counters for the flat-vector rank-bucket encoder.
@@ -268,7 +282,7 @@ pub struct RankBucketMergeSpanEncoder<T: TokenType> {
     seed_tokens: Vec<T>,
     tokens: Vec<TokenNode<T>>,
     pairs: Vec<PairNode>,
-    rank_heads: Vec<Option<usize>>,
+    rank_heads: Vec<usize>,
     active_ranks: HierarchicalBitSet,
     touched_ranks: Vec<usize>,
     token_to_pair: Vec<Option<usize>>,
@@ -288,7 +302,7 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             seed_tokens: Vec::new(),
             tokens: Vec::new(),
             pairs: Vec::new(),
-            rank_heads: vec![None; rank_len],
+            rank_heads: vec![NO_OCCURRENCE; rank_len],
             active_ranks: HierarchicalBitSet::new(rank_len),
             touched_ranks: Vec::new(),
             token_to_pair: Vec::new(),
@@ -321,7 +335,7 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
 
     fn reset_rank_heads(&mut self) {
         for &rank in &self.touched_ranks {
-            self.rank_heads[rank] = None;
+            self.rank_heads[rank] = NO_OCCURRENCE;
         }
         self.touched_ranks.clear();
         self.active_ranks.clear();
@@ -354,18 +368,18 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
         pair_idx: usize,
     ) {
         let rank = self.pairs[pair_idx].rank;
-        if self.rank_heads[rank].is_none() {
+        let head = self.rank_heads[rank];
+        if head == NO_OCCURRENCE {
             self.touched_ranks.push(rank);
             self.set_active_rank(rank);
         }
 
-        let head = self.rank_heads[rank];
-        self.pairs[pair_idx].prev_occurrence_idx = None;
+        self.pairs[pair_idx].prev_occurrence_idx = NO_OCCURRENCE;
         self.pairs[pair_idx].next_occurrence_idx = head;
-        if let Some(head_idx) = head {
-            self.pairs[head_idx].prev_occurrence_idx = Some(pair_idx);
+        if head != NO_OCCURRENCE {
+            self.pairs[head].prev_occurrence_idx = pair_idx;
         }
-        self.rank_heads[rank] = Some(pair_idx);
+        self.rank_heads[rank] = pair_idx;
         if rank < self.current_min_rank {
             self.current_min_rank = rank;
         }
@@ -380,21 +394,21 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
         let start = profile.as_ref().map(|_| Instant::now());
 
         let pair = self.pairs[pair_idx];
-        if let Some(prev_idx) = pair.prev_occurrence_idx {
-            self.pairs[prev_idx].next_occurrence_idx = pair.next_occurrence_idx;
+        if pair.prev_occurrence_idx != NO_OCCURRENCE {
+            self.pairs[pair.prev_occurrence_idx].next_occurrence_idx = pair.next_occurrence_idx;
         } else {
             self.rank_heads[pair.rank] = pair.next_occurrence_idx;
-            if pair.next_occurrence_idx.is_none() {
+            if pair.next_occurrence_idx == NO_OCCURRENCE {
                 self.clear_active_rank(pair.rank);
             }
         }
 
-        if let Some(next_idx) = pair.next_occurrence_idx {
-            self.pairs[next_idx].prev_occurrence_idx = pair.prev_occurrence_idx;
+        if pair.next_occurrence_idx != NO_OCCURRENCE {
+            self.pairs[pair.next_occurrence_idx].prev_occurrence_idx = pair.prev_occurrence_idx;
         }
 
-        self.pairs[pair_idx].prev_occurrence_idx = None;
-        self.pairs[pair_idx].next_occurrence_idx = None;
+        self.pairs[pair_idx].prev_occurrence_idx = NO_OCCURRENCE;
+        self.pairs[pair_idx].next_occurrence_idx = NO_OCCURRENCE;
 
         if let Some(profile) = profile.as_deref_mut() {
             profile.pairs_unlinked += 1;
@@ -421,10 +435,11 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             }
             self.current_min_rank = rank;
 
-            let Some(pair_idx) = self.rank_heads[rank] else {
+            let pair_idx = self.rank_heads[rank];
+            if pair_idx == NO_OCCURRENCE {
                 self.current_min_rank = rank.saturating_add(1);
                 continue;
-            };
+            }
 
             self.unlink_pair(pair_idx, profile.as_deref_mut());
             if let Some(profile) = profile.as_deref_mut() {
@@ -499,8 +514,8 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             left_text_idx: left_idx,
             right_text_idx: right_idx,
             rank: rank as usize,
-            prev_occurrence_idx: None,
-            next_occurrence_idx: None,
+            prev_occurrence_idx: NO_OCCURRENCE,
+            next_occurrence_idx: NO_OCCURRENCE,
         };
         self.token_to_pair[left_idx] = Some(pair_idx);
         self.insert_pair(pair_idx);
