@@ -73,8 +73,26 @@ pub enum SpanEncoderSelector {
 mod tests {
     use core::str::FromStr;
 
-    use super::*;
-    use crate::prelude::*;
+    use super::SpanEncoderSelector;
+    use crate::{
+        TokenEncoder,
+        UnifiedTokenVocab,
+        alloc::{
+            string::ToString,
+            sync::Arc,
+        },
+        disk_cache::WordchipperDiskCache,
+        encoders::token_span_encoder::TokenSpanEncoder,
+        load_vocab,
+        spanners::{
+            TextSpannerBuilder,
+            TextSpanningConfig,
+        },
+        vocab::utility::testing::{
+            build_test_shift_byte_vocab,
+            build_test_vocab,
+        },
+    };
 
     #[test]
     fn test_span_encoder_selector_strum_roundtrip() {
@@ -84,6 +102,59 @@ mod tests {
                 SpanEncoderSelector::from_str(&s).unwrap(),
                 variant,
                 "roundtrip failed for variant string: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_exact_hf_fallback_matches_rank_bucket_merge_behavior() {
+        let vocab: Arc<UnifiedTokenVocab<u32>> = build_test_vocab(
+            build_test_shift_byte_vocab(10),
+            TextSpanningConfig::from_pattern(r".+"),
+        )
+        .with_unicode_scalar_seeding(
+            [(b"e".to_vec(), 500u32)].into_iter().collect(),
+            (10u32..=265).collect(),
+            None,
+        )
+        .into();
+
+        assert!(!vocab.supports_backtrack_encoder());
+
+        let default_encoder = TokenSpanEncoder::<u32>::new_with_selector(
+            TextSpannerBuilder::default(&vocab),
+            vocab.clone(),
+            SpanEncoderSelector::SingleThreadDefault,
+        );
+        let rank_bucket_encoder = TokenSpanEncoder::<u32>::new_with_selector(
+            TextSpannerBuilder::default(&vocab),
+            vocab.clone(),
+            SpanEncoderSelector::RankBucketMerge,
+        );
+
+        for text in ["hello", "éhello", "helloé", "éhelloé"] {
+            assert_eq!(
+                default_encoder.try_encode(text, None).unwrap(),
+                rank_bucket_encoder.try_encode(text, None).unwrap(),
+                "default fallback diverged from explicit rank-bucket encoding for {text:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    #[ignore]
+    fn test_hf_exact_models_do_not_support_backtrack_encoder() {
+        let mut disk_cache = WordchipperDiskCache::default();
+
+        for model in ["hf:google/gemma-4-26B-A4B-it", "hf:Qwen/Qwen3.5-0.8B"] {
+            let vocab: Arc<UnifiedTokenVocab<u32>> = load_vocab(model, &mut disk_cache)
+                .unwrap()
+                .vocab()
+                .clone();
+            assert!(
+                !vocab.supports_backtrack_encoder(),
+                "{model} unexpectedly still supports the backtrack encoder"
             );
         }
     }
@@ -115,7 +186,8 @@ impl SpanEncoderSelector {
                     let bpe_vocab = Arc::new(BpeVocab::from_vocab(vocab));
                     Arc::new(move || Box::new(BpeBacktrackSpanEncoder::new(bpe_vocab.clone())))
                 } else {
-                    Arc::new(|| Box::new(PriorityMergeSpanEncoder::<T>::default()))
+                    let encoder = RankBucketMergeSpanEncoder::<T>::from_vocab(vocab);
+                    Arc::new(move || Box::new(encoder.clone()))
                 }
             }
         }
