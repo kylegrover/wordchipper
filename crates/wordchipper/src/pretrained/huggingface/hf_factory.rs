@@ -1,31 +1,68 @@
-use gguf::{GGUFFile, GGUFMetadata, GGUFMetadataValue, GGUfMetadataValueType};
 use std::path::Path;
+
+use gguf::{
+    GGUFFile,
+    GGUFMetadata,
+    GGUFMetadataValue,
+    GGUfMetadataValueType,
+};
+use serde_json::Value;
 use tokenizers::{
     ModelWrapper::BPE,
     PreTokenizerWrapper,
-    PreTokenizerWrapper::{ByteLevel, Sequence, Split},
+    PreTokenizerWrapper::{
+        ByteLevel,
+        Sequence,
+        Split,
+    },
     pre_tokenizers::split::SplitPattern,
-    tokenizer::NormalizerWrapper,
-    tokenizer::SplitDelimiterBehavior,
-    tokenizer::Tokenizer,
+    tokenizer::{
+        NormalizerWrapper,
+        SplitDelimiterBehavior,
+        Tokenizer,
+    },
 };
 
-use serde_json::Value;
-
 use crate::{
-    LabeledVocab, UnifiedTokenVocab, VocabDescription, VocabIndex, VocabQuery, WCError, WCHashMap,
-    WCHashSet, WCResult,
+    LabeledVocab,
+    UnifiedTokenVocab,
+    VocabDescription,
+    VocabIndex,
+    VocabQuery,
+    WCError,
+    WCHashMap,
+    WCHashSet,
+    WCResult,
     alloc::sync::Arc,
     prelude::*,
     pretrained::{
-        factory::{VocabProvider, VocabProviderInventoryHook},
-        huggingface::patterns::{GEMMA4_PATTERN, QWEN2_PATTERN, QWEN35_PATTERN},
-        openai::{OA_CL100K_BASE_PATTERN, OA_GPT2_PATTERN},
+        factory::{
+            VocabProvider,
+            VocabProviderInventoryHook,
+        },
+        huggingface::patterns::{
+            GEMMA4_PATTERN,
+            QWEN2_PATTERN,
+            QWEN35_PATTERN,
+        },
+        openai::{
+            OA_CL100K_BASE_PATTERN,
+            OA_GPT2_PATTERN,
+        },
     },
     spanners::TextSpanningConfig,
-    support::{normalization::TextNormalizer, regex::RegexPattern, resources::ResourceLoader},
+    support::{
+        normalization::TextNormalizer,
+        regex::RegexPattern,
+        resources::ResourceLoader,
+    },
     vocab::{
-        ByteMapVocab, PairMapVocab, PairRankMap, PairTokenMap, SpanMapVocab, SpanTokenMap,
+        ByteMapVocab,
+        PairMapVocab,
+        PairRankMap,
+        PairTokenMap,
+        SpanMapVocab,
+        SpanTokenMap,
         TokenSpanMap,
     },
 };
@@ -971,6 +1008,80 @@ pub fn vocab_from_gguf_file<P: AsRef<Path>>(path: P) -> WCResult<Arc<UnifiedToke
     vocab_from_gguf_bytes(&bytes)
 }
 
+fn normalize_gguf_query(query: &VocabQuery) -> WCResult<VocabQuery> {
+    if let Some(schema) = query.schema()
+        && schema != "gguf"
+    {
+        return Err(WCError::ResourceNotFound(query.to_string()));
+    }
+
+    let raw_path = match query.path() {
+        Some(path) => crate::alloc::format!("{path}/{}", query.name()),
+        None => query.name().to_string(),
+    };
+
+    let normalized: VocabQuery = raw_path.parse()?;
+    if normalized.schema() != Some("gguf") {
+        return Err(WCError::ResourceNotFound(query.to_string()));
+    }
+
+    Ok(normalized)
+}
+
+fn resolve_gguf_description(query: &VocabQuery) -> WCResult<VocabDescription> {
+    let normalized = normalize_gguf_query(query)?;
+    let path = normalized.clone().with_schema(None).to_string();
+    if !Path::new(&path).is_file() {
+        return Err(WCError::ResourceNotFound(query.to_string()));
+    }
+
+    let context = normalized.to_context();
+    Ok(VocabDescription::new(
+        normalized,
+        &context,
+        "Local GGUF tokenizer file",
+    ))
+}
+
+pub struct GGUFVocabProvider {}
+
+inventory::submit! {
+    VocabProviderInventoryHook::new(|| Arc::new(GGUFVocabProvider{}))
+}
+
+impl VocabProvider for GGUFVocabProvider {
+    fn name(&self) -> String {
+        "gguf".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Local GGUF tokenizer files".to_string()
+    }
+
+    fn list_vocabs(&self) -> Vec<VocabDescription> {
+        vec![]
+    }
+
+    fn resolve_vocab(
+        &self,
+        query: &VocabQuery,
+    ) -> WCResult<VocabDescription> {
+        resolve_gguf_description(query)
+    }
+
+    fn load_vocab(
+        &self,
+        query: &VocabQuery,
+        _loader: &mut dyn ResourceLoader,
+    ) -> WCResult<LabeledVocab<u32>> {
+        let descr = resolve_gguf_description(query)?;
+        let path = descr.id().clone().with_schema(None).to_string();
+        let vocab = vocab_from_gguf_file(&path)?;
+
+        Ok(LabeledVocab::new(descr, vocab))
+    }
+}
+
 pub struct HFVocabProvider {}
 
 inventory::submit! {
@@ -1001,6 +1112,10 @@ impl VocabProvider for HFVocabProvider {
             return Err(WCError::ResourceNotFound(query.to_string()));
         }
 
+        if normalize_gguf_query(query).is_ok() {
+            return Err(WCError::ResourceNotFound(query.to_string()));
+        }
+
         match Tokenizer::from_pretrained(query.clone().with_schema(None).to_string(), None) {
             Ok(tok) => {
                 let vocab = vocab_from_hf_tokenizer(&tok)?;
@@ -1026,13 +1141,47 @@ impl VocabProvider for HFVocabProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use gguf::{
+        GGUFMetadata,
+        GGUFMetadataArrayValue,
+        GGUFMetadataValue,
+        GGUfMetadataValueType,
+    };
+    use tokenizers::{
+        models::bpe::{
+            BPE as HfBpe,
+            Vocab as HfVocab,
+        },
+        normalizers::{
+            Lowercase,
+            NFC,
+            NormalizerWrapper,
+            Replace,
+            Sequence,
+        },
+        tokenizer::SplitDelimiterBehavior,
+    };
+
     use super::*;
-    use crate::{TokenEncoder, TokenizerOptions};
-    use gguf::{GGUFMetadata, GGUFMetadataArrayValue, GGUFMetadataValue, GGUfMetadataValueType};
-    use tokenizers::models::bpe::{BPE as HfBpe, Vocab as HfVocab};
-    use tokenizers::normalizers::Replace;
-    use tokenizers::normalizers::{Lowercase, NFC, NormalizerWrapper, Sequence};
-    use tokenizers::tokenizer::SplitDelimiterBehavior;
+    use crate::{
+        TokenEncoder,
+        TokenizerOptions,
+        load_vocab,
+        resolve_vocab,
+    };
+
+    struct NoopResourceLoader;
+
+    impl ResourceLoader for NoopResourceLoader {
+        fn load_resource_path(
+            &mut self,
+            _resource: &crate::support::resources::KeyedResource,
+        ) -> WCResult<PathBuf> {
+            unreachable!("GGUF provider should not request remote resources")
+        }
+    }
 
     #[test]
     fn test_extract_normalizer_maps_nfc() {
@@ -1414,5 +1563,41 @@ mod tests {
 
         let vocab = vocab_from_gguf_file(&path).unwrap();
         assert_eq!(vocab.lookup_pair_merge(&(256, 257)), Some((0, 258)));
+    }
+
+    #[test]
+    fn test_load_vocab_accepts_local_gguf_path() {
+        let mut tokens = (0u8..=255).map(byte_fallback_token).collect::<Vec<_>>();
+        tokens.push("a".into());
+        tokens.push("b".into());
+        tokens.push("ab".into());
+
+        let mut token_types = vec![6; 256];
+        token_types.extend([1, 1, 1]);
+
+        let metadata = vec![
+            gguf_string_entry(GGUF_TOKENIZER_MODEL_KEY, "gpt2"),
+            gguf_string_entry(GGUF_TOKENIZER_PRE_KEY, "qwen35"),
+            gguf_string_array_entry(GGUF_TOKENIZER_TOKENS_KEY, tokens),
+            gguf_i32_array_entry(GGUF_TOKENIZER_TOKEN_TYPE_KEY, token_types),
+            gguf_string_array_entry(GGUF_TOKENIZER_MERGES_KEY, vec!["a b".into()]),
+        ];
+
+        let dir = tempdir::TempDir::new("wordchipper-gguf-provider").unwrap();
+        let path = dir.path().join("tokenizer.gguf");
+        std::fs::write(&path, build_test_gguf(&metadata)).unwrap();
+
+        let query = path.display().to_string();
+        let resolved = resolve_vocab(&query).unwrap();
+        assert_eq!(resolved.id().schema(), Some("gguf"));
+        assert_eq!(resolved.id().name(), "tokenizer.gguf");
+
+        let mut loader = NoopResourceLoader;
+        let loaded = load_vocab(&query, &mut loader).unwrap();
+        assert_eq!(loaded.description().id().schema(), Some("gguf"));
+        assert_eq!(
+            loaded.vocab().lookup_pair_merge(&(256, 257)),
+            Some((0, 258))
+        );
     }
 }

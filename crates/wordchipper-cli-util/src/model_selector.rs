@@ -10,7 +10,7 @@ use wordchipper::{
 #[derive(clap::Args, Debug)]
 #[group(required = true, multiple = false)]
 pub struct ModelSelectorArgs {
-    /// Model to use for encoding.
+    /// Model ID or local `.gguf` file to use for encoding.
     #[arg(long, default_value = "openai:r50k_base")]
     model: String,
 }
