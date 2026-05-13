@@ -14,35 +14,59 @@ use crate::{
     },
     vocab::{
         ByteMapVocab,
+        PairRankMap,
         PairTokenMap,
+        TokenSpanMap,
         VocabIndex,
         utility::validators::try_vocab_size,
     },
 };
 
-/// Validate that a [`ByteMapVocab`] and [`PairTokenMap`] are compatible.
+fn primitive_spans_from_byte_vocab<T: TokenType>(byte_vocab: &ByteMapVocab<T>) -> TokenSpanMap<T> {
+    byte_vocab
+        .span_pairs()
+        .map(|(span, token)| (token, span))
+        .collect()
+}
+
+fn pair_ranks_from_tokens<T: TokenType>(pairs: &PairTokenMap<T>) -> PairRankMap<T> {
+    pairs.iter()
+        .map(|(&pair, &token)| (pair, token.to_u32().unwrap()))
+        .collect()
+}
+
+/// Validate that primitive spans and pair mappings are compatible.
 ///
 /// - for every ``(a, b) -> t`` entry:
 ///   - the parents ``(a, b)``:
-///     - are either in the `byte_vocab`, or are targets in the map, not both.
-///   - the target ``t`` is not in the `byte_vocab`.
+///     - are either in the primitive token map, or are targets in the map, not both.
+///   - the target ``t`` is not itself a primitive token.
 ///
 /// ## Arguments
-/// * `byte_vocab` - The byte vocabulary to validate against.
+/// * `primitive_spans` - The primitive token expansions to validate against.
 /// * `pairs` - The pair token map to validate.
+/// * `pair_ranks` - The merge-rank map to validate.
 ///
 /// ## Returns
 /// A `Result` indicating whether the maps are compatible.
 pub fn try_validate_pair_map<T: TokenType>(
-    byte_vocab: &ByteMapVocab<T>,
+    primitive_spans: &TokenSpanMap<T>,
     pairs: &PairTokenMap<T>,
+    pair_ranks: &PairRankMap<T>,
 ) -> WCResult<()> {
+    if pairs.len() != pair_ranks.len() || pairs.keys().any(|pair| !pair_ranks.contains_key(pair)) {
+        return Err(crate::WCError::VocabConflict(
+            "pair map and merge-rank map have different keys".into(),
+        ));
+    }
+
+    let primitive_tokens: WCHashSet<T> = primitive_spans.keys().copied().collect();
     let pair_targets: WCHashSet<T> = pairs.values().copied().collect();
 
     for t in &pair_targets {
-        if let Some(b) = byte_vocab.get_byte(*t) {
+        if primitive_tokens.contains(t) {
             return Err(crate::WCError::VocabConflict(crate::alloc::format!(
-                "Target token in pair map {t:?} also mapped to byte {b:0x?}"
+                "target token in pair map {t:?} is also a primitive token"
             )));
         }
     }
@@ -55,15 +79,15 @@ pub fn try_validate_pair_map<T: TokenType>(
     for (&pair, &t) in pairs.iter() {
         for pt in [pair.0, pair.1] {
             let is_pair_target = pair_targets.contains(&pt);
-            let byte_target = byte_vocab.get_byte(pt);
+            let is_primitive = primitive_tokens.contains(&pt);
 
-            if is_pair_target && let Some(b) = byte_target {
+            if is_pair_target && is_primitive {
                 return Err(crate::WCError::NotImplemented(crate::alloc::format!(
-                    "{PRE}Pair {pair:?} -> {t:?} parent {pt:?} is a pair target and byte target: {b:0x?}",
+                    "{PRE}Pair {pair:?} -> {t:?} parent {pt:?} is both a pair target and a primitive token",
                     PRE = ORPHAN_TOKENS_ERROR,
                 )));
             }
-            if !is_pair_target && byte_target.is_none() {
+            if !is_pair_target && !is_primitive {
                 return Err(crate::WCError::NotImplemented(crate::alloc::format!(
                     "{PRE}Pair {pair:?} -> {t:?} parent {pt:?} is not defined",
                     PRE = ORPHAN_TOKENS_ERROR,
@@ -78,18 +102,31 @@ pub fn try_validate_pair_map<T: TokenType>(
 /// Pair ``(T, T) -> T`` Vocabulary.
 ///
 /// - Grounded in a `ByteTable<T>` for byte-to-token mapping.
-/// - Collection of ``(T, T) -> T`` pairs.
-#[derive(Default, Debug, Clone, PartialEq)]
+/// - Contains explicit primitive token expansions.
+/// - Collection of ``(T, T) -> T`` pairs plus merge ranks.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PairMapVocab<T: TokenType> {
     /// Byte/token mapping table.
     byte_vocab: ByteMapVocab<T>,
 
+    /// Primitive token expansions used as encoder/decoder leaves.
+    primitive_spans: TokenSpanMap<T>,
+
     /// Map of ``{ (T, T) -> T }``.
     pair_map: PairTokenMap<T>,
+
+    /// Map of ``{ (T, T) -> rank }``.
+    pair_ranks: PairRankMap<T>,
+}
+
+impl<T: TokenType> Default for PairMapVocab<T> {
+    fn default() -> Self {
+        Self::new(ByteMapVocab::default(), PairTokenMap::default()).unwrap()
+    }
 }
 
 impl<T: TokenType> PairMapVocab<T> {
-    /// Initialize a [`PairMapVocab`].
+    /// Initialize a byte-grounded [`PairMapVocab`].
     ///
     /// ## Arguments
     /// * `byte_vocab` - The byte vocabulary mapping.
@@ -99,13 +136,33 @@ impl<T: TokenType> PairMapVocab<T> {
     /// A `Result` containing the new `PairMapVocab` instance or an error.
     pub fn new(
         byte_vocab: ByteMapVocab<T>,
-        mut pairs: PairTokenMap<T>,
+        pairs: PairTokenMap<T>,
     ) -> WCResult<Self> {
-        try_validate_pair_map(&byte_vocab, &pairs)?;
+        Self::new_with_parts(
+            byte_vocab.clone(),
+            primitive_spans_from_byte_vocab(&byte_vocab),
+            pairs.clone(),
+            pair_ranks_from_tokens(&pairs),
+        )
+    }
+
+    /// Initialize a [`PairMapVocab`] with explicit primitive spans and merge ranks.
+    pub(crate) fn new_with_parts(
+        byte_vocab: ByteMapVocab<T>,
+        mut primitive_spans: TokenSpanMap<T>,
+        mut pairs: PairTokenMap<T>,
+        mut pair_ranks: PairRankMap<T>,
+    ) -> WCResult<Self> {
+        try_validate_pair_map(&primitive_spans, &pairs, &pair_ranks)?;
+        primitive_spans.shrink_to_fit();
         pairs.shrink_to_fit();
+        pair_ranks.shrink_to_fit();
+
         Ok(Self {
             byte_vocab,
+            primitive_spans,
             pair_map: pairs,
+            pair_ranks,
         })
     }
 
@@ -113,8 +170,12 @@ impl<T: TokenType> PairMapVocab<T> {
     pub fn to_token_type<G: TokenType>(&self) -> WCResult<PairMapVocab<G>> {
         try_vocab_size::<G>(self.max_token().unwrap().to_usize().unwrap() + 1)?;
 
-        PairMapVocab::<G>::new(
+        PairMapVocab::<G>::new_with_parts(
             self.byte_vocab.to_token_type::<G>()?,
+            self.primitive_spans
+                .iter()
+                .map(|(&token, span)| (G::from(token).unwrap(), span.clone()))
+                .collect(),
             self.pair_map
                 .iter()
                 .map(|(&(a, b), &token)| {
@@ -124,12 +185,21 @@ impl<T: TokenType> PairMapVocab<T> {
                     )
                 })
                 .collect(),
+            self.pair_ranks
+                .iter()
+                .map(|(&(a, b), &rank)| ((G::from(a).unwrap(), G::from(b).unwrap()), rank))
+                .collect(),
         )
     }
 
     /// Get the byte vocabulary.
     pub fn byte_vocab(&self) -> &ByteMapVocab<T> {
         &self.byte_vocab
+    }
+
+    /// Get the primitive token expansions.
+    pub(crate) fn primitive_spans(&self) -> &TokenSpanMap<T> {
+        &self.primitive_spans
     }
 
     /// Get the map of pairs.
@@ -150,26 +220,36 @@ impl<T: TokenType> PairMapVocab<T> {
     ) -> Option<T> {
         self.pair_map.get(pair).copied()
     }
+
+    /// Looks up a pair together with its merge rank.
+    pub fn lookup_pair_merge(
+        &self,
+        pair: &Pair<T>,
+    ) -> Option<(u32, T)> {
+        self.pair_map
+            .get(pair)
+            .zip(self.pair_ranks.get(pair))
+            .map(|(&token, &rank)| (rank, token))
+    }
 }
 
 impl<T: TokenType> VocabIndex<T> for PairMapVocab<T> {
     type Token = T;
 
     fn len(&self) -> usize {
-        self.byte_vocab.len() + self.pair_map.len()
+        self.primitive_spans.len() + self.pair_map.len()
     }
 
     fn tokens(&self) -> WCHashSet<T> {
-        self.byte_vocab
-            .tokens()
-            .iter()
+        self.primitive_spans
+            .keys()
             .copied()
             .chain(self.pair_map.values().copied())
             .collect::<WCHashSet<T>>()
     }
 
     fn max_token(&self) -> Option<T> {
-        let max_t = self.byte_vocab.max_token();
+        let max_t = self.primitive_spans.keys().max().copied();
         let max_p = self.pair_map.values().max().copied();
         [max_t, max_p].into_iter().flatten().max()
     }
@@ -177,31 +257,28 @@ impl<T: TokenType> VocabIndex<T> for PairMapVocab<T> {
     fn span_pairs(&self) -> impl Iterator<Item = (Vec<u8>, T)> {
         let decoder = PairExpansionDecoder::from_pair_vocab(self);
 
-        self.byte_vocab.span_pairs().chain(
-            self.pair_map
-                .values()
-                .map(move |&t| (decoder.try_decode_to_bytes(&[t]).unwrap().unwrap(), t)),
-        )
+        self.primitive_spans
+            .iter()
+            .map(|(&token, span)| (span.clone(), token))
+            .chain(
+                self.pair_map
+                    .values()
+                    .map(move |&t| (decoder.try_decode_to_bytes(&[t]).unwrap().unwrap(), t)),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vocab::{
-        ByteMapVocab,
-        PairTokenMap,
-    };
+    use crate::vocab::ByteMapVocab;
 
     #[test]
     fn test_tokens_sorted() {
         type T = u32;
         let byte_vocab: ByteMapVocab<T> = Default::default();
 
-        let mut vocab = PairMapVocab::<T> {
-            pair_map: PairTokenMap::default(),
-            byte_vocab: byte_vocab.clone(),
-        };
+        let mut vocab = PairMapVocab::<T>::default();
 
         assert_eq!(vocab.max_token().unwrap(), 255);
 

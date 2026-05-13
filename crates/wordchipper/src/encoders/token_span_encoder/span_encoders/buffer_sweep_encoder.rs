@@ -29,11 +29,9 @@ impl<T: TokenType> SpanEncoder<T> for BufferSweepSpanEncoder<T> {
         span: &[u8],
         tokens: &mut Vec<T>,
     ) {
-        // Fill the working vec with the direct byte token translations.
+        // Fill the working vec with the initial primitive token translations.
         self.working.clear();
-        vocab
-            .byte_vocab()
-            .append_tokens(span, self.working.as_mut());
+        vocab.append_seed_tokens(span, self.working.as_mut());
 
         // Incrementally shrink the working memory
         // Until we can no longer find pairs to merge.
@@ -43,8 +41,13 @@ impl<T: TokenType> SpanEncoder<T> for BufferSweepSpanEncoder<T> {
                 .working
                 .windows(2)
                 .enumerate()
-                .filter_map(|(idx, w)| vocab.lookup_pair(&(w[0], w[1])).map(|token| (token, idx)))
-                .min()
+                .filter_map(|(idx, w)| {
+                    vocab
+                        .lookup_pair_merge(&(w[0], w[1]))
+                        .map(|(rank, token)| (rank, idx, token))
+                })
+                .min_by_key(|&(rank, idx, _)| (rank, idx))
+                .map(|(_, idx, token)| (token, idx))
             {
                 // buf[idx..=idx+1] (a, b) -> buf[idx] t
                 self.working[idx] = token;

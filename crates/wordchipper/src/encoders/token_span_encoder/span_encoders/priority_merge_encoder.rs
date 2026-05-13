@@ -28,10 +28,11 @@ struct Node<T> {
 /// first. `left_tok` and `right_tok` are stored for O(1) stale-entry detection.
 #[derive(Eq)]
 struct MergeEntry<T: Ord> {
-    rank: T,
+    rank: u32,
     left_idx: u32,
     left_tok: T,
     right_tok: T,
+    merge_token: T,
 }
 
 impl<T: Ord> PartialEq for MergeEntry<T> {
@@ -68,6 +69,7 @@ impl<T: Ord> PartialOrd for MergeEntry<T> {
 /// Processes BPE merges in O(n log n) time per span, compared to the
 /// O(n^2) linear-scan approach used by other encoders.
 pub struct PriorityMergeSpanEncoder<T: TokenType> {
+    seed_tokens: Vec<T>,
     nodes: Vec<Node<T>>,
     heap: BinaryHeap<Reverse<MergeEntry<T>>>,
 }
@@ -75,6 +77,7 @@ pub struct PriorityMergeSpanEncoder<T: TokenType> {
 impl<T: TokenType> Default for PriorityMergeSpanEncoder<T> {
     fn default() -> Self {
         Self {
+            seed_tokens: Vec::new(),
             nodes: Vec::new(),
             heap: BinaryHeap::new(),
         }
@@ -103,22 +106,21 @@ impl<T: TokenType> SpanEncoder<T> for PriorityMergeSpanEncoder<T> {
         span: &[u8],
         tokens: &mut Vec<T>,
     ) {
-        let n = span.len();
-        let byte_vocab = vocab.byte_vocab();
+        self.seed_tokens.clear();
+        vocab.append_seed_tokens(span, &mut self.seed_tokens);
+        let n = self.seed_tokens.len();
 
         if n < 2 {
-            for &byte in span {
-                tokens.push(byte_vocab.get_token(byte));
-            }
+            tokens.extend_from_slice(&self.seed_tokens);
             return;
         }
 
-        // Build doubly-linked list of byte tokens.
+        // Build doubly-linked list of primitive tokens.
         self.nodes.clear();
         self.nodes.reserve(n);
-        for (i, &byte) in span.iter().enumerate() {
+        for (i, &token) in self.seed_tokens.iter().enumerate() {
             self.nodes.push(Node {
-                token: byte_vocab.get_token(byte),
+                token,
                 prev: if i == 0 { NONE } else { (i - 1) as u32 },
                 next: if i + 1 < n { (i + 1) as u32 } else { NONE },
             });
@@ -129,12 +131,13 @@ impl<T: TokenType> SpanEncoder<T> for PriorityMergeSpanEncoder<T> {
         for i in 0..(n - 1) {
             let left_tok = self.nodes[i].token;
             let right_tok = self.nodes[i + 1].token;
-            if let Some(rank) = vocab.lookup_pair(&(left_tok, right_tok)) {
+            if let Some((rank, merge_token)) = vocab.lookup_pair_merge(&(left_tok, right_tok)) {
                 self.heap.push(Reverse(MergeEntry {
                     rank,
                     left_idx: i as u32,
                     left_tok,
                     right_tok,
+                    merge_token,
                 }));
             }
         }
@@ -159,7 +162,7 @@ impl<T: TokenType> SpanEncoder<T> for PriorityMergeSpanEncoder<T> {
             }
 
             // Merge: left absorbs right.
-            let new_token = entry.rank;
+            let new_token = entry.merge_token;
             self.nodes[li].token = new_token;
             let right_next = self.nodes[ri].next;
             self.nodes[li].next = right_next;
@@ -171,23 +174,25 @@ impl<T: TokenType> SpanEncoder<T> for PriorityMergeSpanEncoder<T> {
             let left_prev = self.nodes[li].prev;
             if left_prev != NONE {
                 let prev_tok = self.nodes[left_prev as usize].token;
-                if let Some(rank) = vocab.lookup_pair(&(prev_tok, new_token)) {
+                if let Some((rank, merge_token)) = vocab.lookup_pair_merge(&(prev_tok, new_token)) {
                     self.heap.push(Reverse(MergeEntry {
                         rank,
                         left_idx: left_prev,
                         left_tok: prev_tok,
                         right_tok: new_token,
+                        merge_token,
                     }));
                 }
             }
             if right_next != NONE {
                 let next_tok = self.nodes[right_next as usize].token;
-                if let Some(rank) = vocab.lookup_pair(&(new_token, next_tok)) {
+                if let Some((rank, merge_token)) = vocab.lookup_pair_merge(&(new_token, next_tok)) {
                     self.heap.push(Reverse(MergeEntry {
                         rank,
                         left_idx: entry.left_idx,
                         left_tok: new_token,
                         right_tok: next_tok,
+                        merge_token,
                     }));
                 }
             }

@@ -28,6 +28,7 @@ __pycache__/
 *.so
 .venv/
 .pytest_cache
+memories/
 
 # WASM build artifacts
 bindings/wasm/pkg/

@@ -142,6 +142,9 @@ pub use pretrained::{
     load_vocab,
     resolve_vocab,
 };
+#[cfg(feature = "huggingface")]
+#[doc(inline)]
+pub use pretrained::huggingface::vocab_from_hf_tokenizer;
 #[doc(inline)]
 pub use tokenizer::*;
 #[doc(inline)]

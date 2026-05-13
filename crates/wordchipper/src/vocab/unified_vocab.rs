@@ -26,6 +26,17 @@ use crate::{
     },
 };
 
+#[derive(Clone, PartialEq)]
+enum SeedStrategy<T: TokenType> {
+    Bytes(core::marker::PhantomData<T>),
+    #[cfg(any(feature = "huggingface", feature = "download", test))]
+    UnicodeScalars {
+        scalar_tokens: SpanTokenMap<T>,
+        byte_fallback_tokens: Vec<T>,
+        unk_token: Option<T>,
+    },
+}
+
 /// A unified vocabulary structure for BPE tokenization that provides coherent
 /// views of vocabulary components through multiple mapping interfaces.
 ///
@@ -76,6 +87,12 @@ pub struct UnifiedTokenVocab<T: TokenType> {
 
     /// ``{ (T, T) -> T }`` vocabulary.
     pair_vocab: PairMapVocab<T>,
+
+    /// Initial tokenization strategy used before BPE merges.
+    seed_strategy: SeedStrategy<T>,
+
+    /// Whether word spans may be emitted directly from the span vocab.
+    direct_word_lookup: bool,
 }
 
 impl<T: TokenType> UnifiedTokenVocab<T> {
@@ -132,10 +149,16 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         }
 
         let span_tokens = span_vocab.tokens();
+        let primitive_tokens: WCHashSet<T> = pair_vocab.primitive_spans().keys().copied().collect();
+        let available_tokens = span_tokens
+            .iter()
+            .copied()
+            .chain(primitive_tokens.iter().copied())
+            .collect::<WCHashSet<T>>();
         let pair_tokens = pair_vocab.tokens();
-        if !pair_tokens.is_subset(&span_tokens) {
+        if !pair_tokens.is_subset(&available_tokens) {
             let missing = pair_tokens
-                .difference(&span_tokens)
+                .difference(&available_tokens)
                 .copied()
                 .collect::<Vec<_>>();
             return Err(WCError::VocabConflict(
@@ -160,6 +183,8 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
             input_normalizer: None,
             span_vocab,
             pair_vocab,
+            seed_strategy: SeedStrategy::Bytes(core::marker::PhantomData),
+            direct_word_lookup: true,
         })
     }
 
@@ -174,6 +199,26 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
             input_normalizer: self.input_normalizer.clone(),
             span_vocab: self.span_vocab.to_token_type::<G>()?,
             pair_vocab: self.pair_vocab.to_token_type::<G>()?,
+            seed_strategy: match &self.seed_strategy {
+                SeedStrategy::Bytes(_) => SeedStrategy::Bytes(core::marker::PhantomData),
+                #[cfg(any(feature = "huggingface", feature = "download", test))]
+                SeedStrategy::UnicodeScalars {
+                    scalar_tokens,
+                    byte_fallback_tokens,
+                    unk_token,
+                } => SeedStrategy::UnicodeScalars {
+                    scalar_tokens: scalar_tokens
+                        .iter()
+                        .map(|(span, &token)| (span.clone(), G::from(token).unwrap()))
+                        .collect(),
+                    byte_fallback_tokens: byte_fallback_tokens
+                        .iter()
+                        .map(|&token| G::from(token).unwrap())
+                        .collect(),
+                    unk_token: unk_token.map(|token| G::from(token).unwrap()),
+                },
+            },
+            direct_word_lookup: self.direct_word_lookup,
         })
     }
 
@@ -183,6 +228,32 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         normalizer: TextNormalizer,
     ) -> Self {
         self.input_normalizer = Some(normalizer);
+        self
+    }
+
+    #[cfg(any(feature = "huggingface", feature = "download", test))]
+    /// Configure Unicode-scalar seeding before BPE merges.
+    pub(crate) fn with_unicode_scalar_seeding(
+        mut self,
+        scalar_tokens: SpanTokenMap<T>,
+        byte_fallback_tokens: Vec<T>,
+        unk_token: Option<T>,
+    ) -> Self {
+        self.seed_strategy = SeedStrategy::UnicodeScalars {
+            scalar_tokens,
+            byte_fallback_tokens,
+            unk_token,
+        };
+        self
+    }
+
+    #[cfg(any(feature = "huggingface", feature = "download", test))]
+    /// Enable or disable direct whole-span lookup before merge encoding.
+    pub(crate) fn with_direct_word_lookup(
+        mut self,
+        direct_word_lookup: bool,
+    ) -> Self {
+        self.direct_word_lookup = direct_word_lookup;
         self
     }
 
@@ -221,6 +292,54 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         self.span_vocab.byte_vocab()
     }
 
+    /// Return whether word spans may be emitted directly from the span vocab.
+    pub(crate) fn direct_word_lookup(&self) -> bool {
+        self.direct_word_lookup
+    }
+
+    /// Return whether this vocab is compatible with the current backtrack encoder.
+    pub(crate) fn supports_backtrack_encoder(&self) -> bool {
+        matches!(self.seed_strategy, SeedStrategy::Bytes(_))
+            && self.pair_vocab.pair_map().iter().all(|(pair, &token)| {
+                self.lookup_pair_merge(pair)
+                    .is_some_and(|(rank, merge_token)| {
+                        merge_token == token && rank == token.to_u32().unwrap()
+                    })
+            })
+    }
+
+    /// Append the initial seed tokens for a compound span.
+    pub(crate) fn append_seed_tokens(
+        &self,
+        span: &[u8],
+        tokens: &mut Vec<T>,
+    ) {
+        match &self.seed_strategy {
+            SeedStrategy::Bytes(_) => self.byte_vocab().append_tokens(span, tokens),
+            #[cfg(any(feature = "huggingface", feature = "download", test))]
+            SeedStrategy::UnicodeScalars {
+                scalar_tokens,
+                byte_fallback_tokens,
+                unk_token,
+            } => {
+                let text = core::str::from_utf8(span).expect("token spans must remain valid UTF-8");
+                for ch in text.chars() {
+                    let mut buf = [0u8; 4];
+                    let bytes = ch.encode_utf8(&mut buf).as_bytes();
+                    if let Some(&token) = scalar_tokens.get(bytes) {
+                        tokens.push(token);
+                    } else if !byte_fallback_tokens.is_empty() {
+                        tokens.extend(bytes.iter().map(|&byte| byte_fallback_tokens[byte as usize]));
+                    } else if let Some(token) = *unk_token {
+                        tokens.push(token);
+                    } else {
+                        self.byte_vocab().append_tokens(bytes, tokens);
+                    }
+                }
+            }
+        }
+    }
+
     /// Get the `{ Vec<u8> -> T }` special token [`SpanMapVocab`].
     pub fn special_vocab(&self) -> &SpecialVocab<T> {
         self.spanning.specials()
@@ -236,26 +355,24 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
     /// This will include the single-byte entries in the byte map,
     /// as well as the entries in the special tokens map.
     pub fn unified_dictionary(&self) -> TokenSpanMap<T> {
-        let mut tmp = SpanTokenMap::default();
+        let mut tmp = TokenSpanMap::default();
 
         self.span_vocab.iter().for_each(|(chunk, &token)| {
-            tmp.insert(chunk.to_vec(), token);
+            tmp.insert(token, chunk.to_vec());
         });
 
         for (span, token) in self.pair_vocab.span_pairs() {
-            if tmp.contains_key(&span) {
+            if tmp.contains_key(&token) {
                 continue;
             }
-            tmp.insert(span, token);
+            tmp.insert(token, span);
         }
 
         for (span, t) in self.spanning.specials().span_pairs() {
-            tmp.insert(span, t);
+            tmp.insert(t, span);
         }
 
-        tmp.into_iter()
-            .map(|(chunk, token)| (token, chunk))
-            .collect()
+        tmp
     }
 
     /// Looks up a token in the vocabulary using the provided byte slice.
@@ -291,6 +408,14 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
     ) -> Option<T> {
         self.pair_vocab.lookup_pair(pair)
     }
+
+    /// Looks up a given pair together with its merge rank.
+    pub fn lookup_pair_merge(
+        &self,
+        pair: &Pair<T>,
+    ) -> Option<(u32, T)> {
+        self.pair_vocab.lookup_pair_merge(pair)
+    }
 }
 
 impl<T: TokenType> VocabIndex<T> for UnifiedTokenVocab<T> {
@@ -309,12 +434,16 @@ impl<T: TokenType> VocabIndex<T> for UnifiedTokenVocab<T> {
     }
 
     fn span_pairs(&self) -> impl Iterator<Item = (Vec<u8>, T)> {
-        self.span_vocab.span_pairs()
+        self.unified_dictionary()
+            .into_iter()
+            .map(|(token, span)| (span, token))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use num_traits::FromPrimitive;
 
     use super::*;
@@ -367,10 +496,16 @@ mod tests {
             assert_eq!(vocab.span_vocab(), &expected);
         }
 
-        assert_eq!(
-            vocab.span_pairs().collect::<Vec<_>>(),
-            vocab.span_vocab.span_pairs().collect::<Vec<_>>()
-        );
+        let mut actual = vocab.span_pairs().collect::<Vec<_>>();
+        let mut expected = vocab
+            .unified_dictionary()
+            .into_iter()
+            .map(|(token, span)| (span, token))
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+
+        assert_eq!(actual, expected);
 
         assert_eq!(vocab.lookup_token("at".as_bytes()), Some(300));
         assert_eq!(vocab.lookup_token("ate".as_bytes()), Some(301));
@@ -426,6 +561,27 @@ mod tests {
             vocab.to_token_type::<u64>().unwrap().input_normalizer(),
             Some(&TextNormalizer::NFC)
         );
+    }
+
+    #[test]
+    fn test_unicode_scalar_seed_strategy() {
+        let vocab = UnifiedTokenVocab::from_span_vocab(
+            TextSpanningConfig::from_pattern(r".+"),
+            SpanMapVocab::default(),
+        )
+        .unwrap()
+        .with_unicode_scalar_seeding(
+            [("é".as_bytes().to_vec(), 500)].into_iter().collect(),
+            (0u32..=255).collect(),
+            None,
+        )
+        .with_direct_word_lookup(false);
+
+        let mut tokens = Vec::new();
+        vocab.append_seed_tokens("éz".as_bytes(), &mut tokens);
+
+        assert_eq!(tokens, vec![500, b'z' as u32]);
+        assert!(!vocab.direct_word_lookup());
     }
 
     #[test]

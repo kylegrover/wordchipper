@@ -28,6 +28,15 @@ pub enum TextNormalizer {
     /// Normalize with Unicode NFKD.
     NFKD,
 
+    /// Replace all occurrences of `pattern` with `replacement`.
+    Replace {
+        /// The exact substring to replace.
+        pattern: String,
+
+        /// The replacement text.
+        replacement: String,
+    },
+
     /// Apply the normalizers in-order.
     Sequence(Vec<TextNormalizer>),
 }
@@ -43,6 +52,16 @@ impl TextNormalizer {
             Self::NFD => normalize_if_needed(text, is_nfd, |s| s.nfd().collect()),
             Self::NFKC => normalize_if_needed(text, is_nfkc, |s| s.nfkc().collect()),
             Self::NFKD => normalize_if_needed(text, is_nfkd, |s| s.nfkd().collect()),
+            Self::Replace {
+                pattern,
+                replacement,
+            } => {
+                if text.contains(pattern.as_str()) {
+                    Cow::Owned(text.replace(pattern, replacement))
+                } else {
+                    Cow::Borrowed(text)
+                }
+            }
             Self::Sequence(normalizers) => {
                 let mut current: Option<String> = None;
 
@@ -77,6 +96,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     #[test]
@@ -96,5 +117,27 @@ mod tests {
         let normalized = TextNormalizer::Sequence(vec![TextNormalizer::NFD, TextNormalizer::NFC])
             .normalize("éclair café");
         assert_eq!(normalized.as_ref(), "éclair café");
+    }
+
+    #[test]
+    fn test_replace_normalizer_rewrites_spaces() {
+        let normalized = TextNormalizer::Replace {
+            pattern: " ".into(),
+            replacement: "▁".into(),
+        }
+        .normalize("hello world");
+
+        assert_eq!(normalized.as_ref(), "hello▁world");
+    }
+
+    #[test]
+    fn test_replace_normalizer_borrows_when_unchanged() {
+        let normalized = TextNormalizer::Replace {
+            pattern: " ".into(),
+            replacement: "▁".into(),
+        }
+        .normalize("helloworld");
+
+        assert!(matches!(normalized, Cow::Borrowed(_)));
     }
 }
