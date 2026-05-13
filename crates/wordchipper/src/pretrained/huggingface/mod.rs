@@ -2,3 +2,5 @@
 
 pub(crate) mod patterns;
 mod hf_factory;
+
+pub use hf_factory::vocab_from_hf_tokenizer;

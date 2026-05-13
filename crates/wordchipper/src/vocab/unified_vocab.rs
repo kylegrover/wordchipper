@@ -29,7 +29,7 @@ use crate::{
 #[derive(Clone, PartialEq)]
 enum SeedStrategy<T: TokenType> {
     Bytes(core::marker::PhantomData<T>),
-    #[cfg(any(feature = "download", test))]
+    #[cfg(any(feature = "huggingface", feature = "download", test))]
     UnicodeScalars {
         scalar_tokens: SpanTokenMap<T>,
         byte_fallback_tokens: Vec<T>,
@@ -201,7 +201,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
             pair_vocab: self.pair_vocab.to_token_type::<G>()?,
             seed_strategy: match &self.seed_strategy {
                 SeedStrategy::Bytes(_) => SeedStrategy::Bytes(core::marker::PhantomData),
-                #[cfg(any(feature = "download", test))]
+                #[cfg(any(feature = "huggingface", feature = "download", test))]
                 SeedStrategy::UnicodeScalars {
                     scalar_tokens,
                     byte_fallback_tokens,
@@ -231,7 +231,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         self
     }
 
-    #[cfg(any(feature = "download", test))]
+    #[cfg(any(feature = "huggingface", feature = "download", test))]
     /// Configure Unicode-scalar seeding before BPE merges.
     pub(crate) fn with_unicode_scalar_seeding(
         mut self,
@@ -247,7 +247,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
         self
     }
 
-    #[cfg(any(feature = "download", test))]
+    #[cfg(any(feature = "huggingface", feature = "download", test))]
     /// Enable or disable direct whole-span lookup before merge encoding.
     pub(crate) fn with_direct_word_lookup(
         mut self,
@@ -316,7 +316,7 @@ impl<T: TokenType> UnifiedTokenVocab<T> {
     ) {
         match &self.seed_strategy {
             SeedStrategy::Bytes(_) => self.byte_vocab().append_tokens(span, tokens),
-            #[cfg(any(feature = "download", test))]
+            #[cfg(any(feature = "huggingface", feature = "download", test))]
             SeedStrategy::UnicodeScalars {
                 scalar_tokens,
                 byte_fallback_tokens,
