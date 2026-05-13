@@ -9,11 +9,18 @@ use core::time::Duration;
 use std::time::Instant;
 
 use crate::{
-    TokenType,
+    alloc::sync::Arc,
+    types::{
+        Pair,
+        TokenType,
+        hash_map_with_capacity,
+    },
     alloc::vec::Vec,
     encoders::token_span_encoder::SpanEncoder,
     vocab::UnifiedTokenVocab,
 };
+
+type PairLookupMap<T> = crate::types::WCHashMap<Pair<T>, (u32, T)>;
 
 #[derive(Clone, Copy, Default)]
 struct TokenNode<T> {
@@ -43,6 +50,12 @@ pub struct RankBucketMergeProfile {
 
     /// Time spent activating new pair nodes.
     pub activate_pair_time: Duration,
+
+    /// Time spent looking up `(left_tok, right_tok)` in the vocab pair map.
+    pub activate_lookup_time: Duration,
+
+    /// Time spent inserting new pair nodes into the rank occurrence lists.
+    pub activate_insert_time: Duration,
 
     /// Total pair nodes popped from the rank heads.
     pub pairs_popped: u64,
@@ -90,6 +103,8 @@ impl RankBucketMergeProfile {
         self.next_active_rank_time += other.next_active_rank_time;
         self.unlink_pair_time += other.unlink_pair_time;
         self.activate_pair_time += other.activate_pair_time;
+        self.activate_lookup_time += other.activate_lookup_time;
+        self.activate_insert_time += other.activate_insert_time;
         self.pairs_popped += other.pairs_popped;
         self.pairs_rejected_inactive += other.pairs_rejected_inactive;
         self.pairs_rejected_missing_lookup += other.pairs_rejected_missing_lookup;
@@ -249,6 +264,7 @@ impl HierarchicalBitSet {
 /// A [`SpanEncoder`] using flat vectors and rank-indexed occurrence lists.
 pub struct RankBucketMergeSpanEncoder<T: TokenType> {
     max_rank: usize,
+    pair_lookup: Arc<PairLookupMap<T>>,
     seed_tokens: Vec<T>,
     tokens: Vec<TokenNode<T>>,
     pairs: Vec<PairNode>,
@@ -261,10 +277,14 @@ pub struct RankBucketMergeSpanEncoder<T: TokenType> {
 
 impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
     /// Create a new encoder with capacity for ranks up to `max_rank`.
-    pub fn new(max_rank: usize) -> Self {
+    pub fn new(
+        max_rank: usize,
+        pair_lookup: Arc<PairLookupMap<T>>,
+    ) -> Self {
         let rank_len = max_rank + 1;
         Self {
             max_rank,
+            pair_lookup,
             seed_tokens: Vec::new(),
             tokens: Vec::new(),
             pairs: Vec::new(),
@@ -274,6 +294,29 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             token_to_pair: Vec::new(),
             current_min_rank: rank_len,
         }
+    }
+
+    /// Build a new encoder from a vocabulary, caching pair rank lookups once.
+    pub fn from_vocab(vocab: &UnifiedTokenVocab<T>) -> Self {
+        let mut max_rank = 0usize;
+        let mut pair_lookup: PairLookupMap<T> =
+            hash_map_with_capacity(vocab.pair_vocab().pair_map().len());
+
+        for (&pair, &merge_token) in vocab.pair_vocab().pair_map() {
+            if let Some((rank, _)) = vocab.lookup_pair_merge(&pair) {
+                max_rank = max_rank.max(rank as usize);
+                pair_lookup.insert(pair, (rank, merge_token));
+            }
+        }
+
+        Self::new(max_rank, Arc::new(pair_lookup))
+    }
+
+    fn lookup_pair_merge(
+        &self,
+        pair: &Pair<T>,
+    ) -> Option<(u32, T)> {
+        self.pair_lookup.get(pair).copied()
     }
 
     fn reset_rank_heads(&mut self) {
@@ -409,7 +452,6 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
 
     fn activate_pair_starting_at(
         &mut self,
-        vocab: &UnifiedTokenVocab<T>,
         left_idx: usize,
         mut profile: Option<&mut RankBucketMergeProfile>,
     ) {
@@ -427,14 +469,31 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
 
         #[cfg(feature = "std")]
         let start = profile.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "std")]
+        let lookup_start = profile.as_ref().map(|_| Instant::now());
 
         let left_tok = self.tokens[left_idx].token_id;
         let right_tok = self.tokens[right_idx].token_id;
-        let Some((rank, _)) = vocab.lookup_pair_merge(&(left_tok, right_tok)) else {
+        let Some((rank, _)) = self.lookup_pair_merge(&(left_tok, right_tok)) else {
+            if let Some(profile) = profile.as_deref_mut() {
+                #[cfg(feature = "std")]
+                if let Some(lookup_start) = lookup_start {
+                    profile.activate_lookup_time += lookup_start.elapsed();
+                }
+            }
             self.token_to_pair[left_idx] = None;
             return;
         };
 
+        if let Some(profile) = profile.as_deref_mut() {
+            #[cfg(feature = "std")]
+            if let Some(lookup_start) = lookup_start {
+                profile.activate_lookup_time += lookup_start.elapsed();
+            }
+        }
+
+        #[cfg(feature = "std")]
+        let insert_start = profile.as_ref().map(|_| Instant::now());
         let pair_idx = left_idx;
         self.pairs[pair_idx] = PairNode {
             left_text_idx: left_idx,
@@ -448,6 +507,10 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
 
         if let Some(profile) = profile.as_deref_mut() {
             profile.pairs_activated += 1;
+            #[cfg(feature = "std")]
+            if let Some(insert_start) = insert_start {
+                profile.activate_insert_time += insert_start.elapsed();
+            }
             #[cfg(feature = "std")]
             if let Some(start) = start {
                 profile.activate_pair_time += start.elapsed();
@@ -489,7 +552,7 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
         }
 
         for left_idx in (0..(n - 1)).rev() {
-            self.activate_pair_starting_at(vocab, left_idx, profile.as_deref_mut());
+            self.activate_pair_starting_at(left_idx, profile.as_deref_mut());
         }
 
         while let Some(pair_idx) = self.pop_min_pair_profiled(profile.as_deref_mut()) {
@@ -509,7 +572,7 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
 
             let left_tok = self.tokens[left_idx].token_id;
             let right_tok = self.tokens[right_idx].token_id;
-            let Some((rank, merge_token)) = vocab.lookup_pair_merge(&(left_tok, right_tok)) else {
+            let Some((rank, merge_token)) = self.lookup_pair_merge(&(left_tok, right_tok)) else {
                 self.token_to_pair[left_idx] = None;
                 if let Some(profile) = profile.as_deref_mut() {
                     profile.pairs_rejected_missing_lookup += 1;
@@ -547,10 +610,10 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             }
 
             if let Some(prev_idx) = left_prev {
-                self.activate_pair_starting_at(vocab, prev_idx, profile.as_deref_mut());
+                self.activate_pair_starting_at(prev_idx, profile.as_deref_mut());
             }
             if right_next.is_some() {
-                self.activate_pair_starting_at(vocab, left_idx, profile.as_deref_mut());
+                self.activate_pair_starting_at(left_idx, profile.as_deref_mut());
             }
         }
 
@@ -586,7 +649,7 @@ impl<T: TokenType> core::fmt::Debug for RankBucketMergeSpanEncoder<T> {
 
 impl<T: TokenType> Clone for RankBucketMergeSpanEncoder<T> {
     fn clone(&self) -> Self {
-        Self::new(self.max_rank)
+        Self::new(self.max_rank, self.pair_lookup.clone())
     }
 }
 

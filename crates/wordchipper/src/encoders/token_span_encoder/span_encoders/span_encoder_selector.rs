@@ -107,14 +107,8 @@ impl SpanEncoderSelector {
             MergeHeap => Arc::new(|| Box::new(MergeHeapSpanEncoder::<T>::default())),
             PriorityMerge => Arc::new(|| Box::new(PriorityMergeSpanEncoder::<T>::default())),
             RankBucketMerge => {
-                let max_rank = vocab
-                    .pair_vocab()
-                    .pair_map()
-                    .keys()
-                    .filter_map(|pair| vocab.lookup_pair_merge(pair).map(|(rank, _)| rank as usize))
-                    .max()
-                    .unwrap_or(0);
-                Arc::new(move || Box::new(RankBucketMergeSpanEncoder::<T>::new(max_rank)))
+                let encoder = RankBucketMergeSpanEncoder::<T>::from_vocab(vocab);
+                Arc::new(move || Box::new(encoder.clone()))
             }
             ConcurrentDefault | SingleThreadDefault | BpeBacktrack => {
                 if vocab.supports_backtrack_encoder() {

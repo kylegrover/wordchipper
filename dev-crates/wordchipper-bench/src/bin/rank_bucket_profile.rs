@@ -23,16 +23,6 @@ fn repeated(text: &str) -> String {
     text.repeat(10)
 }
 
-fn max_rank(vocab: &wordchipper::UnifiedTokenVocab<u32>) -> usize {
-    vocab
-        .pair_vocab()
-        .pair_map()
-        .keys()
-        .filter_map(|pair| vocab.lookup_pair_merge(pair).map(|(rank, _)| rank as usize))
-        .max()
-        .unwrap_or(0)
-}
-
 fn profile_text(
     model: &str,
     label: &str,
@@ -40,7 +30,7 @@ fn profile_text(
 ) {
     let vocab = load_cached_vocab::<u32>(model).unwrap();
     let spanner = TextSpannerBuilder::default(&vocab);
-    let mut encoder = RankBucketMergeSpanEncoder::<u32>::new(max_rank(vocab.as_ref()));
+    let mut encoder = RankBucketMergeSpanEncoder::<u32>::from_vocab(vocab.as_ref());
     let mut tokens = Vec::new();
     let mut total_profile = RankBucketMergeProfile::default();
 
@@ -68,6 +58,14 @@ fn profile_text(
     println!(
         "  activate_pair_ms={:.3}",
         total_profile.activate_pair_time.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  activate_lookup_ms={:.3}",
+        total_profile.activate_lookup_time.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  activate_insert_ms={:.3}",
+        total_profile.activate_insert_time.as_secs_f64() * 1000.0
     );
     println!("  pairs_popped={}", total_profile.pairs_popped);
     println!("  pairs_merged={}", total_profile.pairs_merged);
