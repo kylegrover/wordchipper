@@ -8,6 +8,27 @@ use crate::{
     prelude::*,
 };
 
+#[cfg(feature = "std")]
+fn parse_local_gguf_query(s: &str) -> Option<VocabQuery> {
+    if !s.to_ascii_lowercase().ends_with(".gguf") {
+        return None;
+    }
+
+    if let Some((prefix, _)) = s.split_once(':')
+        && prefix.len() != 1
+    {
+        return None;
+    }
+
+    let normalized = s.replace('\\', "/");
+    let (path, name): (Option<&str>, &str) = match normalized.rsplit_once('/') {
+        Some((path, name)) => (Some(path), name),
+        None => (None, normalized.as_str()),
+    };
+
+    Some(VocabQuery::new(Some("gguf"), path, name))
+}
+
 /// A lookup query.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct VocabQuery {
@@ -26,6 +47,11 @@ impl FromStr for VocabQuery {
     type Err = WCError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        #[cfg(feature = "std")]
+        if let Some(query) = parse_local_gguf_query(s) {
+            return Ok(query);
+        }
+
         let mut buf = s;
 
         let mut schema: Option<String> = None;
@@ -215,6 +241,33 @@ mod tests {
             q,
             VocabQuery::new(Some("xyz"), Some("foo/bar"), "vocab_name")
         );
+    }
+
+    #[test]
+    fn test_vocab_query_parses_local_gguf_path() {
+        let q = VocabQuery::from_str("models/tokenizer.gguf").unwrap();
+        assert_eq!(q.to_string(), "gguf:models/tokenizer.gguf");
+        assert_eq!(
+            q,
+            VocabQuery::new(Some("gguf"), Some("models"), "tokenizer.gguf")
+        );
+    }
+
+    #[test]
+    fn test_vocab_query_parses_windows_gguf_path() {
+        let q = VocabQuery::from_str(r"C:\models\tokenizer.gguf").unwrap();
+        assert_eq!(q.to_string(), "gguf:C:/models/tokenizer.gguf");
+        assert_eq!(
+            q,
+            VocabQuery::new(Some("gguf"), Some("C:/models"), "tokenizer.gguf")
+        );
+    }
+
+    #[test]
+    fn test_vocab_query_preserves_schema_queries_with_gguf_suffix() {
+        let q = VocabQuery::from_str("hf:repo/model.gguf").unwrap();
+        assert_eq!(q.to_string(), "hf:repo/model.gguf");
+        assert_eq!(q, VocabQuery::new(Some("hf"), Some("repo"), "model.gguf"));
     }
 
     #[test]

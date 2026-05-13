@@ -99,10 +99,7 @@ extern crate alloc;
 pub(crate) mod prelude {
     pub use alloc::{
         boxed::Box,
-        string::{
-            String,
-            ToString,
-        },
+        string::{String, ToString},
         vec::Vec,
     };
 }
@@ -131,27 +128,19 @@ pub use encoders::TokenEncoder;
 pub use encoders::TokenEncoderOptions;
 #[doc(inline)]
 pub use errors::*;
-#[doc(inline)]
-pub use pretrained::{
-    LabeledVocab,
-    VocabDescription,
-    VocabListing,
-    VocabQuery,
-    list_models,
-    list_vocabs,
-    load_vocab,
-    resolve_vocab,
-};
 #[cfg(feature = "huggingface")]
 #[doc(inline)]
-pub use pretrained::huggingface::vocab_from_hf_tokenizer;
+pub use pretrained::huggingface::{
+    vocab_from_gguf_bytes, vocab_from_gguf_file, vocab_from_hf_tokenizer,
+};
+#[doc(inline)]
+pub use pretrained::{
+    LabeledVocab, VocabDescription, VocabListing, VocabQuery, list_models, list_vocabs, load_vocab,
+    resolve_vocab,
+};
 #[doc(inline)]
 pub use tokenizer::*;
 #[doc(inline)]
 pub use types::*;
 #[doc(inline)]
-pub use vocab::{
-    SpecialFilter,
-    UnifiedTokenVocab,
-    VocabIndex,
-};
+pub use vocab::{SpecialFilter, UnifiedTokenVocab, VocabIndex};
