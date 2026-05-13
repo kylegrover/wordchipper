@@ -67,6 +67,14 @@ fn profile_text(
         "  activate_insert_ms={:.3}",
         total_profile.activate_insert_time.as_secs_f64() * 1000.0
     );
+    println!(
+        "  activate_insert_rank_ms={:.3}",
+        total_profile.activate_insert_rank_time.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  activate_insert_rewire_ms={:.3}",
+        total_profile.activate_insert_rewire_time.as_secs_f64() * 1000.0
+    );
     println!("  pairs_popped={}", total_profile.pairs_popped);
     println!("  pairs_merged={}", total_profile.pairs_merged);
     println!("  pairs_unlinked={}", total_profile.pairs_unlinked);

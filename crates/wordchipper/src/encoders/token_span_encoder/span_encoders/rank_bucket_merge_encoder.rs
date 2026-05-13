@@ -71,6 +71,12 @@ pub struct RankBucketMergeProfile {
     /// Time spent inserting new pair nodes into the rank occurrence lists.
     pub activate_insert_time: Duration,
 
+    /// Time spent updating rank-head bookkeeping during pair activation.
+    pub activate_insert_rank_time: Duration,
+
+    /// Time spent rewiring pair occurrence sibling links during activation.
+    pub activate_insert_rewire_time: Duration,
+
     /// Total pair nodes popped from the rank heads.
     pub pairs_popped: u64,
 
@@ -119,6 +125,8 @@ impl RankBucketMergeProfile {
         self.activate_pair_time += other.activate_pair_time;
         self.activate_lookup_time += other.activate_lookup_time;
         self.activate_insert_time += other.activate_insert_time;
+        self.activate_insert_rank_time += other.activate_insert_rank_time;
+        self.activate_insert_rewire_time += other.activate_insert_rewire_time;
         self.pairs_popped += other.pairs_popped;
         self.pairs_rejected_inactive += other.pairs_rejected_inactive;
         self.pairs_rejected_missing_lookup += other.pairs_rejected_missing_lookup;
@@ -366,7 +374,11 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
     fn insert_pair(
         &mut self,
         pair_idx: usize,
+        mut profile: Option<&mut RankBucketMergeProfile>,
     ) {
+        #[cfg(feature = "std")]
+        let bookkeeping_start = profile.as_ref().map(|_| Instant::now());
+
         let rank = self.pairs[pair_idx].rank;
         let head = self.rank_heads[rank];
         if head == NO_OCCURRENCE {
@@ -374,14 +386,42 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             self.set_active_rank(rank);
         }
 
+        if let Some(profile) = profile.as_deref_mut() {
+            #[cfg(feature = "std")]
+            if let Some(bookkeeping_start) = bookkeeping_start {
+                profile.activate_insert_rank_time += bookkeeping_start.elapsed();
+            }
+        }
+
+        #[cfg(feature = "std")]
+        let rewire_start = profile.as_ref().map(|_| Instant::now());
+
         self.pairs[pair_idx].prev_occurrence_idx = NO_OCCURRENCE;
         self.pairs[pair_idx].next_occurrence_idx = head;
         if head != NO_OCCURRENCE {
             self.pairs[head].prev_occurrence_idx = pair_idx;
         }
+
+        if let Some(profile) = profile.as_deref_mut() {
+            #[cfg(feature = "std")]
+            if let Some(rewire_start) = rewire_start {
+                profile.activate_insert_rewire_time += rewire_start.elapsed();
+            }
+        }
+
+        #[cfg(feature = "std")]
+        let bookkeeping_finish_start = profile.as_ref().map(|_| Instant::now());
+
         self.rank_heads[rank] = pair_idx;
         if rank < self.current_min_rank {
             self.current_min_rank = rank;
+        }
+
+        if let Some(profile) = profile.as_deref_mut() {
+            #[cfg(feature = "std")]
+            if let Some(bookkeeping_finish_start) = bookkeeping_finish_start {
+                profile.activate_insert_rank_time += bookkeeping_finish_start.elapsed();
+            }
         }
     }
 
@@ -518,7 +558,7 @@ impl<T: TokenType> RankBucketMergeSpanEncoder<T> {
             next_occurrence_idx: NO_OCCURRENCE,
         };
         self.token_to_pair[left_idx] = Some(pair_idx);
-        self.insert_pair(pair_idx);
+        self.insert_pair(pair_idx, profile.as_deref_mut());
 
         if let Some(profile) = profile.as_deref_mut() {
             profile.pairs_activated += 1;
@@ -681,7 +721,6 @@ impl<T: TokenType> SpanEncoder<T> for RankBucketMergeSpanEncoder<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{
         TokenEncoder,
         TokenType,
